@@ -1,0 +1,339 @@
+<#
+.SYNOPSIS
+    [Runbook 9] Reports SharePoint sharing exposure - anonymous links,
+    organization-wide links, and external/guest access - on every document
+    library of every site in the tenant. Microsoft Graph only, no
+    PnP.PowerShell dependency anywhere in this script.
+
+.DESCRIPTION
+    This is a *sharing exposure* audit, not a full permissions audit -
+    complements Runbook 8 (8-Audit-SharePointSitePermissions.ps1), which
+    reports Site Collection Administrators and Owners/Members/Visitors group
+    membership via PnP. That data is NOT obtainable from Microsoft Graph
+    today - there is no Graph endpoint for SharePoint's classic group model
+    (no site collection admins, no Owners/Members/Visitors rosters, no
+    "has unique role assignments" flag on the site/web). Confirmed current
+    limitation, not an oversight in this script. If you need that data, it
+    still has to come from Runbook 8.
+
+    What Graph DOES give us, and what this script reports instead: every
+    direct permission grant and every sharing link on the ROOT of each
+    document library (drive) in each site, via
+    GET /sites/{id}/drives/{id}/root/permissions. For each permission found:
+
+      - PermissionType: AnonymousLink / OrganizationLink / OtherLink / Direct
+      - Who it's granted to (direct grantee email, redeemed link users, or a
+        pending sharing invitation email)
+      - IsExternal - grantee's email domain checked against the tenant's
+        verified domains (via GET /organization, covered by the
+        Directory.Read.All permission already granted to the managed
+        identity for the other runbooks - no extra scope needed for this
+        part)
+      - HasPassword / ExpirationDateTime on links
+      - Roles (read/write/owner)
+
+    Scope and known gaps (read before treating "no findings" as "no risk"):
+      - Item/list/file-level unique permissions and individual document
+        sharing links are NOT enumerated - only the drive ROOT. A per-file
+        crawl tenant-wide is a different order of magnitude of Graph calls
+        and belongs in its own scoped script if ever needed.
+      - Site Collection Administrators and the default permission groups are
+        out of scope here - see Runbook 8.
+      - A site can have more than one drive (multiple document libraries);
+        this script checks all of them, not just "Documents".
+
+.NOTES
+    Managed identity needs:
+      Sites.Read.All          Graph app permission - NEW, not yet granted.
+                               Add to the same CR addendum already tracking
+                               RoleManagement.Read.Directory and
+                               Reports.Read.All (see prod-cutover notes) -
+                               this is the third scope going beyond the
+                               signed CR's original 3-permission list.
+      Directory.Read.All      already granted (Sept 3) - reused here for the
+                               verified-domains lookup, no new grant needed.
+      Mail.Send                already granted - report delivery.
+
+    Deliberately uses ONLY Microsoft.Graph.Authentication + raw
+    Invoke-MgGraphRequest calls - no Microsoft.Graph.Sites /
+    Microsoft.Graph.Files typed cmdlets, and critically no PnP.PowerShell.
+    That means this script has NO PowerShell-version floor: it runs fine on
+    the current PS 7.2 Automation Account runtime as well as a future 7.4
+    Runtime Environment, unlike Runbook 8 / Runbook 2 / the new
+    site-permissions script, which are all pinned to PnP.PowerShell 2.12.0
+    specifically because PnP 3.x needs PS 7.4.6+ (see the Sept 9 PnP
+    incident notes). This script sidesteps that whole problem - it is not
+    affected by the pending 7.2-vs-7.4 runtime decision either way.
+
+    Enumeration: GET /sites/getAllSites (requires Sites.Read.All,
+    application-only - this is the same endpoint the Get-MgAllSite cmdlet
+    wraps). This is NOT the same as /sites?search=* , which misses sites
+    with no crawled/indexed content and behaves inconsistently for this kind
+    of tenant-wide sweep.
+
+    Performance: one Graph call per site to list drives, one call per drive
+    (plus pagination) to list root permissions. Lighter than Runbook 8 (no
+    per-site PnP connection overhead) but still scales with site count x
+    drive count. Start $MaxSitesToProcess small to time a run before
+    trusting a schedule, same as Runbook 8.
+
+    Throttling: Invoke-GraphRequestWithRetry below does exponential backoff
+    on 429/503/504 rather than a fixed Start-Sleep between every call - Graph
+    read throttling is bursty, a flat delay either wastes time when there is
+    no pressure or is not long enough when there is.
+#>
+
+# ===================== CONFIG =====================
+$IncludeOneDriveSites   = $false                                   # EDIT - personal OneDrive sites are usually out of scope for this audit
+$ExcludedUrlPatterns    = @("*/sites/appcatalog*")                  # EDIT - wildcards matched against Site URL
+$FlagAnonymousLinks     = $true                                     # anonymous ("anyone") links always flagged for review
+$FlagOrganizationLinks  = $true                                     # org-wide ("anyone in company") links flagged for review too
+$MaxNamesPerCell        = 25                                         # cap grantee emails listed per CSV cell before "+N more"
+$MaxSitesToProcess      = 0                                          # EDIT - 0 = no limit; set a small number (e.g. 25) to time-test a run first
+$SenderMailbox          = "m365-audits@yourtenant.com"               # EDIT
+$ReportRecipients       = @("secops@yourtenant.com")                 # EDIT
+# ==================================================
+
+Import-Module Microsoft.Graph.Authentication
+# NOTE: this dot-source only resolves when the file sits next to a Common\
+# folder (local testing layout, see README.md). Pasted into an Azure
+# Automation runbook there is no filesystem, so either inline the
+# Send-ReportEmail function above this line, or publish it as a module and
+# Import-Module it instead - same caveat as every other script in this set.
+. (Join-Path $PSScriptRoot "Common\Send-ReportEmail.ps1")
+
+function ConvertTo-JoinedNames {
+    param([string[]]$Names, [int]$MaxNames)
+    if (-not $Names -or $Names.Count -eq 0) { return "" }
+    $unique = $Names | Sort-Object -Unique
+    if ($unique.Count -le $MaxNames) { return ($unique -join "; ") }
+    $shown = $unique | Select-Object -First $MaxNames
+    return ("{0}; +{1} more" -f ($shown -join "; "), ($unique.Count - $MaxNames))
+}
+
+function Invoke-GraphRequestWithRetry {
+    param([string]$Uri, [string]$Method = "GET", [int]$MaxRetries = 5)
+    $attempt = 0
+    while ($true) {
+        try {
+            return Invoke-MgGraphRequest -Method $Method -Uri $Uri -ErrorAction Stop
+        }
+        catch {
+            $attempt++
+            $msg = $_.Exception.Message
+            $isThrottleOrTransient = $msg -match '429|TooManyRequests|503|504|ServiceUnavailable|GatewayTimeout'
+            if ($isThrottleOrTransient -and $attempt -le $MaxRetries) {
+                $backoffSeconds = [math]::Min(60, [math]::Pow(2, $attempt))
+                Write-Warning "Graph request throttled/transient error (attempt $attempt/$MaxRetries) - backing off $backoffSeconds s. Uri: $Uri"
+                Start-Sleep -Seconds $backoffSeconds
+                continue
+            }
+            throw
+        }
+    }
+}
+
+function Get-GraphCollection {
+    param([string]$Uri)
+    $results = New-Object System.Collections.Generic.List[object]
+    $nextUri = $Uri
+    while ($nextUri) {
+        $resp = Invoke-GraphRequestWithRetry -Uri $nextUri
+        if ($resp.value) { $results.AddRange([object[]]$resp.value) }
+        $nextUri = $resp.'@odata.nextLink'
+    }
+    return $results
+}
+
+Connect-MgGraph -Identity   # uses the Automation Account's managed identity, no prompts
+
+$tempDir   = [System.IO.Path]::GetTempPath()
+$timestamp = Get-Date -Format "yyyy-MM-dd_HHmm"
+$outFile   = Join-Path $tempDir "SharePointSharingExposure_$timestamp.csv"
+
+# ---- Verified domains, for the external-grantee check ---------------------
+$verifiedDomains = @()
+try {
+    $org = Invoke-GraphRequestWithRetry -Uri "https://graph.microsoft.com/v1.0/organization?`$select=verifiedDomains"
+    if ($org.value -and $org.value[0].verifiedDomains) {
+        $verifiedDomains = $org.value[0].verifiedDomains | ForEach-Object { $_.name.ToLower() }
+    }
+}
+catch {
+    Write-Warning "Could not read verified domains (Directory.Read.All not granted?) - external-user detection will be skipped for this run. Underlying error: $($_.Exception.Message)"
+}
+
+# ---- Enumerate every site in the tenant ------------------------------------
+Write-Output "Enumerating sites tenant-wide via Microsoft Graph (getAllSites)..."
+$sitesUri = "https://graph.microsoft.com/v1.0/sites/getAllSites?`$select=id,name,displayName,webUrl,isPersonalSite&`$top=200"
+
+try {
+    $allSites = Get-GraphCollection -Uri $sitesUri
+}
+catch {
+    throw "Failed to enumerate sites via /sites/getAllSites. Confirm Sites.Read.All is granted (application permission) to the managed identity's service principal. Underlying error: $($_.Exception.Message)"
+}
+
+if (-not $IncludeOneDriveSites) {
+    $allSites = $allSites | Where-Object { -not $_.isPersonalSite }
+}
+foreach ($pattern in $ExcludedUrlPatterns) {
+    $allSites = $allSites | Where-Object { $_.webUrl -notlike $pattern }
+}
+if ($MaxSitesToProcess -gt 0 -and $allSites.Count -gt $MaxSitesToProcess) {
+    Write-Output "MaxSitesToProcess=$MaxSitesToProcess set - trimming from $($allSites.Count) sites."
+    $allSites = $allSites | Select-Object -First $MaxSitesToProcess
+}
+
+Write-Output "Processing $($allSites.Count) site(s) - checking every document library's root permissions."
+
+# ---- Walk each site's drives and their root permissions --------------------
+$results   = New-Object System.Collections.Generic.List[object]
+$processed = 0
+
+foreach ($site in $allSites) {
+
+    $processed++
+    if ($processed % 25 -eq 0) { Write-Output "  ...$processed / $($allSites.Count) sites processed" }
+
+    try {
+        $drives = Get-GraphCollection -Uri "https://graph.microsoft.com/v1.0/sites/$($site.id)/drives?`$select=id,name,webUrl"
+
+        if (-not $drives -or $drives.Count -eq 0) {
+            $results.Add([PSCustomObject]@{
+                SiteUrl = $site.webUrl; SiteName = $site.displayName; DriveName = ""
+                PermissionType = ""; GrantedTo = ""; LinkScope = ""; LinkType = ""; Roles = ""
+                IsExternal = $false; HasPassword = $false; ExpirationDateTime = ""
+                Status = "NoDrives"; RecommendedAction = "OK"
+            }) | Out-Null
+            continue
+        }
+
+        foreach ($drive in $drives) {
+            $perms = Get-GraphCollection -Uri "https://graph.microsoft.com/v1.0/sites/$($site.id)/drives/$($drive.id)/root/permissions"
+
+            foreach ($perm in $perms) {
+
+                $isLink    = $null -ne $perm.link
+                $linkScope = if ($isLink) { $perm.link.scope } else { "" }
+                $linkType  = if ($isLink) { $perm.link.type } else { "" }
+
+                # Grantee emails come from three possible shapes: a direct
+                # grant (grantedToV2), a link that's been redeemed by one or
+                # more people (grantedToIdentitiesV2), or a pending sharing
+                # invitation that hasn't been accepted yet (invitation.email).
+                $emails = @()
+                if ($perm.grantedToV2 -and $perm.grantedToV2.user -and $perm.grantedToV2.user.email) {
+                    $emails += $perm.grantedToV2.user.email
+                }
+                if ($perm.grantedToIdentitiesV2) {
+                    foreach ($identity in $perm.grantedToIdentitiesV2) {
+                        if ($identity.user -and $identity.user.email) { $emails += $identity.user.email }
+                    }
+                }
+                if ($perm.invitation -and $perm.invitation.email) { $emails += $perm.invitation.email }
+                $emails = $emails | Where-Object { $_ } | Sort-Object -Unique
+
+                $isExternal = $false
+                if ($emails.Count -gt 0 -and $verifiedDomains.Count -gt 0) {
+                    $internalMatchFound = $emails | ForEach-Object {
+                        $parts = $_ -split '@'
+                        if ($parts.Count -eq 2) { $parts[1].ToLower() }
+                    } | Where-Object { $verifiedDomains -contains $_ } | Select-Object -First 1
+                    $isExternal = -not [bool]$internalMatchFound
+                }
+
+                $permType =
+                    if ($linkScope -eq "anonymous")        { "AnonymousLink" }
+                    elseif ($linkScope -eq "organization") { "OrganizationLink" }
+                    elseif ($isLink)                        { "OtherLink" }
+                    else                                     { "Direct" }
+
+                $recommendedAction =
+                    if ($permType -eq "AnonymousLink" -and $FlagAnonymousLinks)          { "Review-Anonymous-Link" }
+                    elseif ($permType -eq "OrganizationLink" -and $FlagOrganizationLinks) { "Review-OrgWide-Link" }
+                    elseif ($isExternal)                                                  { "Review-External-Access" }
+                    else                                                                  { "OK" }
+
+                $results.Add([PSCustomObject]@{
+                    SiteUrl            = $site.webUrl
+                    SiteName           = $site.displayName
+                    DriveName          = $drive.name
+                    PermissionType     = $permType
+                    GrantedTo          = ConvertTo-JoinedNames -Names $emails -MaxNames $MaxNamesPerCell
+                    LinkScope          = $linkScope
+                    LinkType           = $linkType
+                    Roles              = ($perm.roles -join ",")
+                    IsExternal         = $isExternal
+                    HasPassword        = [bool]$perm.hasPassword
+                    ExpirationDateTime = $perm.expirationDateTime
+                    Status             = "OK"
+                    RecommendedAction  = $recommendedAction
+                }) | Out-Null
+            }
+        }
+    }
+    catch {
+        Write-Warning "Could not read drive/permission data for $($site.webUrl): $($_.Exception.Message)"
+        $results.Add([PSCustomObject]@{
+            SiteUrl = $site.webUrl; SiteName = $site.displayName; DriveName = ""
+            PermissionType = ""; GrantedTo = ""; LinkScope = ""; LinkType = ""; Roles = ""
+            IsExternal = $false; HasPassword = $false; ExpirationDateTime = ""
+            Status = "AccessDenied"; RecommendedAction = "Grant-Access-Needed"
+        }) | Out-Null
+    }
+}
+
+# ---- Export, ranked by risk -------------------------------------------------
+$riskRank = @{
+    "Review-Anonymous-Link"   = 0
+    "Review-External-Access"  = 1
+    "Review-OrgWide-Link"     = 2
+    "Grant-Access-Needed"     = 3
+    "OK"                      = 4
+}
+$export = $results | Sort-Object @{Expression = { $riskRank[$_.RecommendedAction] }}, SiteUrl
+$export | Export-Csv -Path $outFile -NoTypeInformation -Encoding UTF8
+
+# ---- Summary -----------------------------------------------------------------
+$totalRows           = $results.Count
+$sitesProcessed       = $allSites.Count
+$anonymousCount       = ($results | Where-Object { $_.RecommendedAction -eq "Review-Anonymous-Link" }).Count
+$orgWideCount         = ($results | Where-Object { $_.RecommendedAction -eq "Review-OrgWide-Link" }).Count
+$externalCount        = ($results | Where-Object { $_.RecommendedAction -eq "Review-External-Access" }).Count
+$accessDeniedCount    = ($results | Where-Object { $_.Status -eq "AccessDenied" }).Count
+
+Write-Output "Sites processed: $sitesProcessed | Permission rows: $totalRows | Anonymous links: $anonymousCount | Org-wide links: $orgWideCount | External grants: $externalCount | AccessDenied: $accessDeniedCount"
+
+$topRows = $export | Where-Object { $_.RecommendedAction -ne "OK" } |
+    Select-Object -First 20 | ForEach-Object {
+        "<tr><td>$($_.SiteUrl)</td><td>$($_.DriveName)</td><td>$($_.PermissionType)</td><td>$($_.GrantedTo)</td><td>$($_.RecommendedAction)</td></tr>"
+    }
+
+$accessDeniedWarning = if ($accessDeniedCount -gt 0) {
+    "<p style='color:#b00'><b>Warning:</b> $accessDeniedCount site(s) could not be read (Access Denied) - see the attachment. Confirm Sites.Read.All is granted before assuming these have no exposure.</p>"
+} else { "" }
+
+$bodyHtml = @"
+<p>SharePoint sharing exposure audit (Microsoft Graph only) - $sitesProcessed site(s) checked, $totalRows permission row(s) found on document library roots.</p>
+$accessDeniedWarning
+<ul>
+  <li><b>$anonymousCount</b> anonymous ("anyone") link(s) found - highest exposure, review first</li>
+  <li><b>$orgWideCount</b> organization-wide link(s) found</li>
+  <li><b>$externalCount</b> direct grant(s) or invitation(s) to an external/guest email address</li>
+  <li><b>$accessDeniedCount</b> site(s) the identity could not read</li>
+</ul>
+<p>Highest-priority rows:</p>
+<table border='1' cellpadding='4' cellspacing='0' style='border-collapse:collapse;font-family:Segoe UI,Arial;font-size:12px'>
+<tr style='background:#f2f2f2'><th align='left'>Site URL</th><th align='left'>Library</th><th align='left'>Type</th><th align='left'>Granted To</th><th align='left'>Action</th></tr>
+$($topRows -join "`n")
+</table>
+<p style='font-size:11px;color:#666'>Scope: document-library ROOT permissions only, via Microsoft Graph - no PnP.PowerShell used. Site Collection Administrators and Owners/Members/Visitors group rosters are NOT covered here (Graph has no endpoint for that) - see the separate SharePoint Site Permissions audit for that data. Item/file-level unique permissions are not enumerated. Full detail attached.</p>
+"@
+
+Send-ReportEmail -SenderMailbox $SenderMailbox -Recipients $ReportRecipients `
+    -Subject "M365 Audit: SharePoint Sharing Exposure ($timestamp)" -BodyHtml $bodyHtml -AttachmentPath $outFile
+
+Remove-Item $outFile -Force -ErrorAction SilentlyContinue
+Disconnect-MgGraph | Out-Null
+Write-Output "Done."

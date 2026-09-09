@@ -95,12 +95,63 @@ $ReportRecipients       = @("secops@yourtenant.com")                 # EDIT
 # ==================================================
 
 Import-Module Microsoft.Graph.Authentication
-# NOTE: this dot-source only resolves when the file sits next to a Common\
-# folder (local testing layout, see README.md). Pasted into an Azure
-# Automation runbook there is no filesystem, so either inline the
-# Send-ReportEmail function above this line, or publish it as a module and
-# Import-Module it instead - same caveat as every other script in this set.
-. (Join-Path $PSScriptRoot "Common\Send-ReportEmail.ps1")
+
+# Inlined rather than dot-sourced: $PSScriptRoot is empty when this script is
+# pasted directly into an Azure Automation runbook (no filesystem backing
+# it), so the Join-Path/dot-source pattern used for local testing throws
+# "Cannot bind argument to parameter 'Path' because it is an empty string."
+# Kept byte-for-byte identical to Common\Send-ReportEmail.ps1 (from
+# "Automation on MT.zip") so behavior doesn't drift between the local-test
+# and Automation-Account versions of this script.
+function Send-ReportEmail {
+    param(
+        [Parameter(Mandatory = $true)][string]$SenderMailbox,
+        [Parameter(Mandatory = $true)][string[]]$Recipients,
+        [Parameter(Mandatory = $true)][string]$Subject,
+        [Parameter(Mandatory = $true)][string]$BodyHtml,
+        [Parameter(Mandatory = $true)][string]$AttachmentPath
+    )
+
+    if (-not (Test-Path $AttachmentPath)) {
+        throw "Attachment not found: $AttachmentPath"
+    }
+
+    $fileBytes = [System.IO.File]::ReadAllBytes($AttachmentPath)
+    $fileName  = Split-Path $AttachmentPath -Leaf
+    $base64    = [System.Convert]::ToBase64String($fileBytes)
+
+    $message = @{
+        message = @{
+            subject = $Subject
+            body = @{
+                contentType = "HTML"
+                content     = $BodyHtml
+            }
+            toRecipients = @(
+                $Recipients | ForEach-Object {
+                    @{ emailAddress = @{ address = $_ } }
+                }
+            )
+            attachments = @(
+                @{
+                    "@odata.type" = "#microsoft.graph.fileAttachment"
+                    name          = $fileName
+                    contentType   = "text/csv"
+                    contentBytes  = $base64
+                }
+            )
+        }
+        saveToSentItems = $false
+    }
+
+    $bodyJson = $message | ConvertTo-Json -Depth 10
+
+    Invoke-MgGraphRequest -Method POST `
+        -Uri "https://graph.microsoft.com/v1.0/users/$SenderMailbox/sendMail" `
+        -Body $bodyJson -ContentType "application/json"
+
+    Write-Output "Email sent to: $($Recipients -join ', ') with attachment $fileName"
+}
 
 function ConvertTo-JoinedNames {
     param([string[]]$Names, [int]$MaxNames)

@@ -1,0 +1,268 @@
+<#
+.SYNOPSIS
+    [Runbook 1] Flags Entra ID sign-ins that are from outside BOTH an
+    approved country list AND a set of approved IPv4 CIDR ranges. Runs
+    unattended via the Automation Account's managed identity and emails
+    the CSV report. No interactive login.
+
+.NOTES
+    Managed identity needs Graph app permissions: AuditLog.Read.All,
+    Directory.Read.All, Mail.Send.
+
+    Trust logic: a sign-in is treated as APPROVED (and left out of the
+    report) if EITHER the country matches $ApprovedCountries OR the
+    source IP falls inside one of $ApprovedIPRanges. This is deliberate —
+    a trusted office/VPN egress IP can legitimately geolocate to a
+    country you haven't whitelisted, and you don't want that flooding
+    the suspicious-logins report. A sign-in is only flagged when it
+    matches NEITHER.
+
+    IP range matching is IPv4-only (CIDR, e.g. "203.0.113.0/24"). An
+    IPv6 sign-in IP will never match a range and falls back to the
+    country check alone — that's expected, not a bug.
+#>
+
+# ===================== CONFIG — EDIT THESE =====================
+
+$ApprovedCountries  = @("US", "CA")                   # ISO 3166-1 alpha-2 codes
+
+$ApprovedIPRanges   = @(
+    "203.0",      # EDIT: e.g. corporate office public IP range
+    "198..1"    # EDIT: e.g. VPN / trusted egress range
+)                                                                  # IPv4 CIDR ranges
+
+$LookbackDays       = 30
+
+$SenderMailbox      = "t"             # EDIT: a real mailbox in your tenant
+
+$ReportRecipients   = @("")            # EDIT: who receives the report
+
+# =================================================================
+
+Import-Module Microsoft.Graph.Authentication
+
+Import-Module Microsoft.Graph.Reports
+
+function Send-ReportEmail {
+
+    param(
+
+        [Parameter(Mandatory = $true)][string]$SenderMailbox,
+
+        [Parameter(Mandatory = $true)][string[]]$Recipients,
+
+        [Parameter(Mandatory = $true)][string]$Subject,
+
+        [Parameter(Mandatory = $true)][string]$BodyHtml,
+
+        [Parameter(Mandatory = $true)][string]$AttachmentPath
+
+    )
+
+    $fileBytes = [System.IO.File]::ReadAllBytes($AttachmentPath)
+
+    $fileName  = Split-Path $AttachmentPath -Leaf
+
+    $base64    = [System.Convert]::ToBase64String($fileBytes)
+
+    $message = @{
+
+        message = @{
+
+            subject      = $Subject
+
+            body         = @{ contentType = "HTML"; content = $BodyHtml }
+
+            toRecipients = @($Recipients | ForEach-Object { @{ emailAddress = @{ address = $_ } } })
+
+            attachments  = @(@{
+
+                "@odata.type" = "#microsoft.graph.fileAttachment"
+
+                name          = $fileName
+
+                contentType   = "text/csv"
+
+                contentBytes  = $base64
+
+            })
+
+        }
+
+        saveToSentItems = $false
+
+    }
+
+    Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/users/$SenderMailbox/sendMail" -Body ($message | ConvertTo-Json -Depth 10) -ContentType "application/json"
+
+    Write-Output "Email sent to: $($Recipients -join ', ') with attachment $fileName"
+
+}
+
+function Test-IPInCIDRRange {
+
+    <#
+        Returns $true if $IPAddress falls inside the IPv4 $CIDR block
+        (e.g. "203.0.113.0/24"). Returns $false for anything IPv6, any
+        unparsable input, or a genuine miss — never throws, so a single
+        malformed IP or CIDR entry can't kill the whole run.
+    #>
+
+    param(
+        [Parameter(Mandatory = $true)][string]$IPAddress,
+        [Parameter(Mandatory = $true)][string]$CIDR
+    )
+
+    try {
+        $cidrParts = $CIDR -split '/'
+        if ($cidrParts.Count -ne 2) { return $false }
+
+        $networkAddress = [System.Net.IPAddress]::Parse($cidrParts[0])
+        $prefixLength    = [int]$cidrParts[1]
+        $testAddress     = [System.Net.IPAddress]::Parse($IPAddress)
+
+        if ($testAddress.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork -or
+            $networkAddress.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) {
+            return $false   # IPv6 (or anything non-IPv4) — not supported, treat as no match
+        }
+
+        $ipBytes  = $testAddress.GetAddressBytes()
+        $netBytes = $networkAddress.GetAddressBytes()
+        [Array]::Reverse($ipBytes)
+        [Array]::Reverse($netBytes)
+        $ipInt  = [BitConverter]::ToUInt32($ipBytes, 0)
+        $netInt = [BitConverter]::ToUInt32($netBytes, 0)
+
+        # NOTE: mask is kept as Int64, never cast down to [uint32] or ANDed
+        # against a bare 0xFFFFFFFF literal. PowerShell parses 0xFFFFFFFF as
+        # an Int32 (value -1), so a naive "-band 0xFFFFFFFF" is a silent
+        # no-op, and casting the pre-mask shifted value to [uint32] throws
+        # for any prefix shorter than /32. Comparing in Int64 space avoids
+        # both traps -- $ipInt/$netInt are 32-bit values so the extra high
+        # bits of the mask never affect the comparison.
+        $maskInt = if ($prefixLength -le 0) {
+            [int64]0
+        } else {
+            ([int64][uint32]::MaxValue) -shl (32 - $prefixLength)
+        }
+
+        return ($ipInt -band $maskInt) -eq ($netInt -band $maskInt)
+    }
+    catch {
+        Write-Warning "Could not evaluate IP '$IPAddress' against CIDR '$CIDR': $_"
+        return $false
+    }
+
+}
+
+function Test-IPApproved {
+
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$IPAddress,
+        [Parameter(Mandatory = $true)][string[]]$ApprovedRanges
+    )
+
+    if ([string]::IsNullOrWhiteSpace($IPAddress)) { return $false }
+
+    foreach ($range in $ApprovedRanges) {
+        if (Test-IPInCIDRRange -IPAddress $IPAddress -CIDR $range) { return $true }
+    }
+
+    return $false
+
+}
+
+# ---------------- Main ----------------
+
+Connect-MgGraph -Identity
+
+$tempDir = [System.IO.Path]::GetTempPath()
+
+$startDate = (Get-Date).AddDays(-$LookbackDays).ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+$filter = "createdDateTime ge $startDate"
+
+Write-Output "Pulling sign-in logs since $startDate ..."
+
+$signIns = Get-MgAuditLogSignIn -Filter $filter -All
+
+Write-Output "Retrieved $($signIns.Count) sign-in events."
+
+$results = foreach ($s in $signIns) {
+
+    $countryCode = $s.Location.CountryOrRegion
+
+    $ipAddress   = $s.IpAddress
+
+    $countryApproved = $ApprovedCountries -contains $countryCode
+
+    $ipApproved      = Test-IPApproved -IPAddress $ipAddress -ApprovedRanges $ApprovedIPRanges
+
+    if (-not $countryApproved -and -not $ipApproved) {
+
+        [PSCustomObject]@{
+
+            UserPrincipalName = $s.UserPrincipalName
+
+            DisplayName       = $s.UserDisplayName
+
+            AppDisplayName    = $s.AppDisplayName
+
+            CountryOrRegion   = $countryCode
+
+            City              = $s.Location.City
+
+            IPAddress         = $ipAddress
+
+            CreatedDateTime   = $s.CreatedDateTime
+
+            Status            = if ($s.Status.ErrorCode -eq 0) { "Success" } else { "Failure" }
+
+            ConditionalAccess = $s.ConditionalAccessStatus
+
+            RiskLevel         = $s.RiskLevelDuringSignIn
+
+            RiskDetail        = $s.RiskDetail
+
+        }
+
+    }
+
+}
+
+$results = $results | Sort-Object CreatedDateTime -Descending
+
+$timestamp = Get-Date -Format "yyyy-MM-dd_HHmm"
+
+$outFile = Join-Path $tempDir "SuspiciousLogins_$timestamp.csv"
+
+$results | Export-Csv -Path $outFile -NoTypeInformation -Encoding UTF8
+
+$successfulFromUnapproved = ($results | Where-Object { $_.Status -eq "Success" }).Count
+
+$bodyHtml = @"
+<p>Suspicious login audit for the last $LookbackDays day(s).</p>
+<p><b>$($results.Count)</b> sign-ins from outside both the approved countries and approved IP ranges, of which
+<b>$successfulFromUnapproved</b> succeeded. Full detail attached.</p>
+<p><i>Approved countries: $($ApprovedCountries -join ', ')</i></p>
+<p><i>Approved IP ranges: $($ApprovedIPRanges -join ', ')</i></p>
+
+"@
+
+$emailParams = @{
+    SenderMailbox = $SenderMailbox
+    Recipients = $ReportRecipients
+    Subject = "CrucialLogics monthly Maintenance | M365 Audit: Suspicious Logins ($timestamp)"
+    BodyHtml = $bodyHtml
+    AttachmentPath = $outFile
+
+
+}
+
+Send-ReportEmail @emailParams
+
+Remove-Item $outFile -Force
+
+Disconnect-MgGraph | Out-Null
+
+Write-Output "Done. Report emailed to $($ReportRecipients -join ', ')."

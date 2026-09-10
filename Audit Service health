@@ -1,0 +1,296 @@
+<#
+.SYNOPSIS
+    [Runbook 11] Daily M365 tenant service health check - current per-service
+    status (Exchange, SharePoint, Teams, etc.) plus full detail on every
+    active incident/advisory, via Microsoft Graph's Service Communications
+    API. Meant to be attached to a daily schedule in the Automation Account
+    (Ashutosh's choice, Sept 10) - always emails a report on every run,
+    same as Runbooks 1/9/10; no alert-suppression/dedup logic, by design.
+
+.DESCRIPTION
+    Two Graph endpoints, both under /admin/serviceAnnouncement/:
+
+      healthOverviews - current status of every licensed service in the
+      tenant (ServiceOperational / ServiceDegradation / ServiceInterruption /
+      Investigating / RestoringService / VerifyingService / ExtendedRecovery /
+      ServiceRestored / PostIncidentReviewPublished / FalsePositive /
+      InvestigationSuspended). One row per service, always reported - this is
+      what answers "is anything down right now" at a glance.
+
+      issues - the actual incidents/advisories behind a non-operational
+      status: title, classification (incident vs advisory), impact
+      description, start/last-modified time, and isResolved. Reported for
+      every service, not just the ones currently degraded, because an issue
+      can resolve between two daily runs and still be worth a line in
+      today's report (see $IncludeResolvedWithinDays below) - a clean
+      healthOverviews status the day after an incident closed shouldn't look
+      identical to a day with no incident at all.
+
+    Both endpoints are read in one pass; results are normalized into a single
+    flat table (RowType = ServiceStatus or Issue) so one CSV covers both,
+    same "one attachment" pattern as every other runbook in this set.
+
+.NOTES
+    Managed identity needs:
+      ServiceHealth.Read.All   Graph application permission - NEW, not yet
+                               granted. Add to the same CR addendum already
+                               tracking RoleManagement.Read.Directory,
+                               Reports.Read.All, and Sites.Read.All (see
+                               prod-cutover notes) - this is a narrow,
+                               read-only scope, same category as those, NOT
+                               the broader Power Platform Administrator
+                               directory role Runbook 10 needed.
+      Mail.Send                already granted - report delivery.
+
+    Uses only Microsoft.Graph.Authentication + raw Invoke-MgGraphRequest,
+    same as Runbook 9 - no typed Graph submodule, no PnP, no PowerShell-
+    version floor. Runs fine on the current PS 7.2 Automation Account
+    runtime or a future 7.4 Runtime Environment either way.
+
+    Throttling: same Invoke-GraphRequestWithRetry exponential-backoff helper
+    as Runbook 9 (429/503/504), rather than a fixed delay between calls -
+    this endpoint set is small (two calls plus pagination) so throttling is
+    unlikely in practice, but the helper costs nothing to keep consistent.
+
+    Not in scope here - a deliberate line, not an oversight: Message Center
+    (/admin/serviceAnnouncement/messages) - planned changes, feature
+    rollouts, deprecations. That is roadmap information, not outage
+    information, and mixing it into a health-check report would bury the
+    "is something down" signal this script exists to surface fast. Build it
+    as its own runbook later if wanted.
+#>
+
+# ===================== CONFIG =====================
+$FlagAdvisories            = $true    # EDIT - $false to only flag Incident-classified issues, not lower-severity Advisories
+$IncludeResolvedWithinDays = 2         # EDIT - issues resolved in the last N days still get an informational row (0 = only currently-unresolved issues)
+$SenderMailbox              = "m365-audits@yourtenant.com"    # EDIT
+$ReportRecipients           = @("secops@yourtenant.com")      # EDIT
+# ==================================================
+
+Import-Module Microsoft.Graph.Authentication
+
+# Inlined rather than dot-sourced - see the $PSScriptRoot/Join-Path incident
+# notes (Sept 9): a runbook pasted into the Azure Automation editor has no
+# backing file, so $PSScriptRoot is empty and a dot-sourced Common\ script
+# fails to resolve. Kept byte-for-byte identical to Common\Send-ReportEmail.ps1
+# so behavior doesn't drift between the local-test and Automation-Account
+# versions of this script.
+function Send-ReportEmail {
+    param(
+        [Parameter(Mandatory = $true)][string]$SenderMailbox,
+        [Parameter(Mandatory = $true)][string[]]$Recipients,
+        [Parameter(Mandatory = $true)][string]$Subject,
+        [Parameter(Mandatory = $true)][string]$BodyHtml,
+        [Parameter(Mandatory = $true)][string]$AttachmentPath
+    )
+
+    if (-not (Test-Path $AttachmentPath)) {
+        throw "Attachment not found: $AttachmentPath"
+    }
+
+    $fileBytes = [System.IO.File]::ReadAllBytes($AttachmentPath)
+    $fileName  = Split-Path $AttachmentPath -Leaf
+    $base64    = [System.Convert]::ToBase64String($fileBytes)
+
+    $message = @{
+        message = @{
+            subject = $Subject
+            body = @{
+                contentType = "HTML"
+                content     = $BodyHtml
+            }
+            toRecipients = @(
+                $Recipients | ForEach-Object {
+                    @{ emailAddress = @{ address = $_ } }
+                }
+            )
+            attachments = @(
+                @{
+                    "@odata.type" = "#microsoft.graph.fileAttachment"
+                    name          = $fileName
+                    contentType   = "text/csv"
+                    contentBytes  = $base64
+                }
+            )
+        }
+        saveToSentItems = $false
+    }
+
+    $bodyJson = $message | ConvertTo-Json -Depth 10
+
+    Invoke-MgGraphRequest -Method POST `
+        -Uri "https://graph.microsoft.com/v1.0/users/$SenderMailbox/sendMail" `
+        -Body $bodyJson -ContentType "application/json"
+
+    Write-Output "Email sent to: $($Recipients -join ', ') with attachment $fileName"
+}
+
+function Invoke-GraphRequestWithRetry {
+    param([string]$Uri, [string]$Method = "GET", [int]$MaxRetries = 5)
+    $attempt = 0
+    while ($true) {
+        try {
+            return Invoke-MgGraphRequest -Method $Method -Uri $Uri -ErrorAction Stop
+        }
+        catch {
+            $attempt++
+            $msg = $_.Exception.Message
+            $isThrottleOrTransient = $msg -match '429|TooManyRequests|503|504|ServiceUnavailable|GatewayTimeout'
+            if ($isThrottleOrTransient -and $attempt -le $MaxRetries) {
+                $backoffSeconds = [math]::Min(60, [math]::Pow(2, $attempt))
+                Write-Warning "Graph request throttled/transient error (attempt $attempt/$MaxRetries) - backing off $backoffSeconds s. Uri: $Uri"
+                Start-Sleep -Seconds $backoffSeconds
+                continue
+            }
+            throw
+        }
+    }
+}
+
+function Get-GraphCollection {
+    param([string]$Uri)
+    $results = New-Object System.Collections.Generic.List[object]
+    $nextUri = $Uri
+    while ($nextUri) {
+        $resp = Invoke-GraphRequestWithRetry -Uri $nextUri
+        if ($resp.value) { $results.AddRange([object[]]$resp.value) }
+        $nextUri = $resp.'@odata.nextLink'
+    }
+    return $results
+}
+
+Connect-MgGraph -Identity   # uses the Automation Account's managed identity, no prompts
+
+$tempDir   = [System.IO.Path]::GetTempPath()
+$timestamp = Get-Date -Format "yyyy-MM-dd_HHmm"
+$outFile   = Join-Path $tempDir "M365ServiceHealth_$timestamp.csv"
+
+# ---- Pull current per-service status ---------------------------------------
+Write-Output "Fetching current service health overview..."
+try {
+    $healthOverviews = Get-GraphCollection -Uri "https://graph.microsoft.com/v1.0/admin/serviceAnnouncement/healthOverviews"
+}
+catch {
+    throw "Failed to fetch service health overviews. Confirm ServiceHealth.Read.All is granted (application permission) to the managed identity's service principal. Underlying error: $($_.Exception.Message)"
+}
+
+# ---- Pull issues (incidents + advisories) behind those statuses -----------
+Write-Output "Fetching service health issues..."
+try {
+    $allIssues = Get-GraphCollection -Uri "https://graph.microsoft.com/v1.0/admin/serviceAnnouncement/issues"
+}
+catch {
+    Write-Warning "Failed to fetch service health issues - report will show service status only, with no issue detail. $($_.Exception.Message)"
+    $allIssues = @()
+}
+
+$cutoff = (Get-Date).AddDays(-$IncludeResolvedWithinDays)
+$relevantIssues = $allIssues | Where-Object {
+    (-not $_.isResolved) -or
+    ($IncludeResolvedWithinDays -gt 0 -and $_.lastModifiedDateTime -and [datetime]$_.lastModifiedDateTime -ge $cutoff)
+}
+
+# ---- Normalize into one flat, risk-ranked table -----------------------------
+$results = New-Object System.Collections.Generic.List[object]
+
+foreach ($svc in $healthOverviews) {
+    $issueCount = ($allIssues | Where-Object { $_.service -eq $svc.service -and -not $_.isResolved }).Count
+
+    $recommendedAction =
+        if ($svc.status -notin @("ServiceOperational", "ServiceRestored", "PostIncidentReviewPublished", "FalsePositive")) { "Review-ServiceDegraded" }
+        else { "OK" }
+
+    $results.Add([PSCustomObject]@{
+        RowType             = "ServiceStatus"
+        Service             = $svc.service
+        Title               = ""
+        Classification      = ""
+        Status              = $svc.status
+        IsResolved          = ""
+        ActiveIssueCount    = $issueCount
+        ImpactDescription   = ""
+        StartDateTime       = ""
+        LastModifiedDateTime = ""
+        RecommendedAction   = $recommendedAction
+    }) | Out-Null
+}
+
+foreach ($issue in $relevantIssues) {
+
+    $isIncident = $issue.classification -eq "incident"
+    $recommendedAction =
+        if (-not $issue.isResolved -and $isIncident)                          { "Review-ActiveIncident" }
+        elseif (-not $issue.isResolved -and $FlagAdvisories)                   { "Review-ActiveAdvisory" }
+        elseif (-not $issue.isResolved)                                        { "Informational-ActiveAdvisory" }
+        else                                                                    { "Informational-RecentlyResolved" }
+
+    $results.Add([PSCustomObject]@{
+        RowType             = "Issue"
+        Service             = $issue.service
+        Title               = $issue.title
+        Classification      = $issue.classification
+        Status              = $issue.status
+        IsResolved          = $issue.isResolved
+        ActiveIssueCount    = ""
+        ImpactDescription   = $issue.impactDescription
+        StartDateTime       = $issue.startDateTime
+        LastModifiedDateTime = $issue.lastModifiedDateTime
+        RecommendedAction   = $recommendedAction
+    }) | Out-Null
+}
+
+# ---- Export, ranked by risk -------------------------------------------------
+$riskRank = @{
+    "Review-ServiceDegraded"          = 0
+    "Review-ActiveIncident"           = 0
+    "Review-ActiveAdvisory"           = 1
+    "Informational-ActiveAdvisory"    = 2
+    "Informational-RecentlyResolved"  = 3
+    "OK"                              = 4
+}
+$export = $results | Sort-Object @{Expression = { $riskRank[$_.RecommendedAction] }}, Service
+$export | Export-Csv -Path $outFile -NoTypeInformation -Encoding UTF8
+
+# ---- Summary -----------------------------------------------------------------
+$degradedServiceCount = ($results | Where-Object { $_.RecommendedAction -eq "Review-ServiceDegraded" }).Count
+$activeIncidentCount  = ($results | Where-Object { $_.RecommendedAction -eq "Review-ActiveIncident" }).Count
+$activeAdvisoryCount  = ($results | Where-Object { $_.RecommendedAction -in @("Review-ActiveAdvisory", "Informational-ActiveAdvisory") }).Count
+$recentlyResolvedCount = ($results | Where-Object { $_.RecommendedAction -eq "Informational-RecentlyResolved" }).Count
+$totalServices         = $healthOverviews.Count
+
+Write-Output "Services checked: $totalServices | Degraded/non-operational: $degradedServiceCount | Active incidents: $activeIncidentCount | Active advisories: $activeAdvisoryCount | Recently resolved: $recentlyResolvedCount"
+
+$topRows = $export | Where-Object { $_.RecommendedAction -notin @("OK", "Informational-RecentlyResolved") } |
+    Select-Object -First 25 | ForEach-Object {
+        "<tr><td>$($_.Service)</td><td>$($_.RowType)</td><td>$($_.Title)</td><td>$($_.Status)</td><td>$($_.RecommendedAction)</td></tr>"
+    }
+
+$allClearBanner = if ($degradedServiceCount -eq 0 -and $activeIncidentCount -eq 0 -and $activeAdvisoryCount -eq 0) {
+    "<p style='color:#080'><b>All services operational, no active incidents or advisories.</b></p>"
+} else {
+    "<p style='color:#b00'><b>$degradedServiceCount service(s) non-operational, $activeIncidentCount active incident(s), $activeAdvisoryCount active advisory/advisories - see below.</b></p>"
+}
+
+$bodyHtml = @"
+<p>M365 tenant service health check - $totalServices service(s) checked.</p>
+$allClearBanner
+<ul>
+  <li><b>$degradedServiceCount</b> service(s) currently non-operational</li>
+  <li><b>$activeIncidentCount</b> active incident(s)</li>
+  <li><b>$activeAdvisoryCount</b> active advisory/advisories</li>
+  <li><b>$recentlyResolvedCount</b> issue(s) resolved in the last $IncludeResolvedWithinDays day(s) - informational only</li>
+</ul>
+<p>Highest-priority rows:</p>
+<table border='1' cellpadding='4' cellspacing='0' style='border-collapse:collapse;font-family:Segoe UI,Arial;font-size:12px'>
+<tr style='background:#f2f2f2'><th align='left'>Service</th><th align='left'>Type</th><th align='left'>Title</th><th align='left'>Status</th><th align='left'>Action</th></tr>
+$($topRows -join "`n")
+</table>
+<p style='font-size:11px;color:#666'>Source: Microsoft Graph Service Communications API (/admin/serviceAnnouncement). Full detail attached. Message Center (planned changes/deprecations) is intentionally not covered here - see script header.</p>
+"@
+
+Send-ReportEmail -SenderMailbox $SenderMailbox -Recipients $ReportRecipients `
+    -Subject "M365 Audit: Tenant Service Health ($timestamp)" -BodyHtml $bodyHtml -AttachmentPath $outFile
+
+Remove-Item $outFile -Force -ErrorAction SilentlyContinue
+Disconnect-MgGraph | Out-Null
+Write-Output "Done."

@@ -1,0 +1,343 @@
+<#
+.SYNOPSIS
+    One-time report: size of EVERY document library on every SharePoint Online site.
+
+
+.\Get-SPOLibrarySizes.ps1 -TenantName nppapi -ClientId <guid> 
+
+
+.DESCRIPTION
+    Same auth model as Get-PreservationHoldLibrarySize.ps1:
+    - Authenticates ONCE (interactive/MFA) against the SPO admin center.
+    - Pulls a SharePoint access token from that connection (-Decoded -> .EncodedToken) and connects to
+      every site/subsite with -AccessToken. No re-prompt. Tokens cached per host, refreshed every 40 min.
+
+    Per library it reports (via Get-PnPFolderStorageMetric, same numbers as storman.aspx):
+        TotalSizeGB        = current files + version history + metadata (what counts against quota)
+        CurrentFilesGB     = latest file versions only
+        VersionOverheadGB  = TotalSize - CurrentFiles (how much version history is costing you)
+
+    Output: one CSV row per library, written as it goes (crash-safe).
+
+    Default scope: visible document libraries + Preservation Hold Library, root web only.
+    Use -IncludeSubsites and -IncludeHidden to widen it.
+
+.REQUIREMENTS
+    - PowerShell 7.4+, PnP.PowerShell 3.x
+    - Your own Entra ID app registration (delegated SharePoint AllSites.FullControl, admin consented)
+    - SharePoint Administrator + site collection admin on each site (or use -GrantTempAdmin)
+
+.PARAMETER TenantName
+    Tenant prefix, e.g. "contoso" for contoso.sharepoint.com
+
+.PARAMETER ClientId
+    App (client) ID of your PnP Entra app registration.
+
+.PARAMETER SiteUrls
+    Optional. Only scan these site URLs (great for a test run before hitting the whole tenant).
+
+.PARAMETER IncludeSubsites
+    Also scan libraries in subsites (classic sites). Adds one connection per subsite.
+
+.PARAMETER IncludeHidden
+    Include hidden libraries (Form Templates, etc.). The Preservation Hold Library is always included.
+
+.PARAMETER IncludeOneDrive
+    Also scan OneDrive for Business sites.
+
+.PARAMETER GrantTempAdmin
+    On access denied, temporarily add -AdminUpn as site collection admin, scan, then remove.
+    OFF by default — check change control before using on client tenants.
+
+.PARAMETER AdminUpn
+    UPN of the running account. Required with -GrantTempAdmin.
+
+.EXAMPLE
+    # Test on two sites first
+    ./Get-SPOLibrarySizes.ps1 -TenantName contoso -ClientId <guid> -SiteUrls "https://contoso.sharepoint.com/sites/HR","https://contoso.sharepoint.com/sites/Finance"
+
+.EXAMPLE
+    # Whole tenant incl. subsites
+    ./Get-SPOLibrarySizes.ps1 -TenantName contoso -ClientId <guid> -IncludeSubsites
+#>
+
+#Requires -Version 7.2
+#Requires -Modules PnP.PowerShell
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)] [string]   $TenantName,
+    [Parameter(Mandatory)] [string]   $ClientId,
+    [string[]] $SiteUrls,
+    [string]   $OutputPath = (Join-Path $PWD "SPO_Library_Sizes_$($TenantName)_$(Get-Date -Format 'yyyyMMdd_HHmm').csv"),
+    [switch]   $IncludeSubsites,
+    [switch]   $IncludeHidden,
+    [switch]   $IncludeOneDrive,
+    [switch]   $GrantTempAdmin,
+    [string]   $AdminUpn
+)
+
+$ErrorActionPreference = 'Stop'
+
+if ($GrantTempAdmin -and -not $AdminUpn) {
+    throw "-AdminUpn is required when -GrantTempAdmin is used."
+}
+
+$adminUrl = "https://$TenantName-admin.sharepoint.com"
+
+# ---------------------------------------------------------------------------
+# 1. Single interactive sign-in
+# ---------------------------------------------------------------------------
+Write-Host "Connecting to $adminUrl (you'll be prompted once)..." -ForegroundColor Cyan
+$adminConn = Connect-PnPOnline -Url $adminUrl -ClientId $ClientId -Interactive -ReturnConnection
+
+# ---------------------------------------------------------------------------
+# 2. Enumerate sites
+# ---------------------------------------------------------------------------
+Write-Host "Enumerating sites..." -ForegroundColor Cyan
+$siteParams = @{ Connection = $adminConn }
+if ($IncludeOneDrive) { $siteParams.IncludeOneDriveSites = $true }
+
+$sites = Get-PnPTenantSite @siteParams | Where-Object {
+    $_.Template -notmatch '^(REDIRECTSITE|SRCHCEN|SPSMSITEHOST|APPCATALOG|POINTPUBLISHINGHUB|EDISC|TEAMCHANNEL)' -and
+    $_.LockState -ne 'NoAccess'
+}
+
+if ($SiteUrls) {
+    $wanted = $SiteUrls | ForEach-Object { $_.TrimEnd('/').ToLowerInvariant() }
+    $sites  = $sites | Where-Object { $wanted -contains $_.Url.TrimEnd('/').ToLowerInvariant() }
+}
+
+$total = @($sites).Count
+Write-Host "Found $total sites to scan. Output: $OutputPath" -ForegroundColor Cyan
+
+# ---------------------------------------------------------------------------
+# Helper: SharePoint token per host from the single admin connection. Never prompts.
+# ---------------------------------------------------------------------------
+$tokenCache = @{}
+function Get-SpoToken {
+    param([Parameter(Mandatory)] [string] $SiteUrl)
+
+    $spoHost = ([uri]$SiteUrl).Host
+    $cached  = $tokenCache[$spoHost]
+    if ($cached -and ((Get-Date) - $cached.Acquired).TotalMinutes -lt 40) {
+        return $cached.Token
+    }
+
+    # -Decoded is required: in newer PnP builds -ResourceUrl alone matches two parameter sets
+    # ("Resource Url" and "List Permission Scopes") and fails to resolve.
+    $jwt   = Get-PnPAccessToken -ResourceUrl "https://$spoHost/.default" -Decoded -Connection $adminConn
+    $token = $jwt.EncodedToken
+    if ([string]::IsNullOrWhiteSpace($token)) { throw "Could not acquire SharePoint token for $spoHost" }
+    $tokenCache[$spoHost] = @{ Token = $token; Acquired = Get-Date }
+    return $token
+}
+
+function Connect-SpoWeb {
+    param([Parameter(Mandatory)] [string] $Url)
+    Connect-PnPOnline -Url $Url -AccessToken (Get-SpoToken -SiteUrl $Url) -ReturnConnection
+}
+
+# ---------------------------------------------------------------------------
+# Helper: one row object (keeps CSV columns identical for every row)
+# ---------------------------------------------------------------------------
+function New-Row {
+    param($Site)
+    [ordered]@{
+        SiteUrl            = $Site.Url
+        SiteTitle          = $Site.Title
+        SiteTemplate       = $Site.Template
+        SiteStorageUsedGB  = [math]::Round($Site.StorageUsageCurrent / 1024, 2)   # StorageUsageCurrent is MB
+        WebUrl             = $null
+        LibraryTitle       = $null
+        LibraryUrl         = $null
+        IsPHL              = $false
+        Hidden             = $null
+        ItemCount          = $null
+        FileCount          = $null
+        TotalSizeGB        = $null
+        TotalSizeMB        = $null
+        CurrentFilesGB     = $null
+        VersionOverheadGB  = $null
+        PercentOfSite      = $null
+        LastModified       = $null
+        TempAdminGranted   = $false
+        Status             = 'OK'
+        Error              = $null
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Helper: scan all libraries in one web -> returns row objects
+# ---------------------------------------------------------------------------
+function Get-WebLibraryRows {
+    param(
+        [Parameter(Mandatory)] $WebConn,
+        [Parameter(Mandatory)] [string] $WebUrl,
+        [Parameter(Mandatory)] $Site
+    )
+
+    $lists = Get-PnPList -Connection $WebConn -Includes RootFolder, ItemCount, BaseType, IsCatalog
+
+    $libs = $lists | Where-Object {
+        $isPhl = $_.RootFolder.ServerRelativeUrl -match '/PreservationHoldLibrary$'
+        $_.BaseType -eq 'DocumentLibrary' -and
+        -not $_.IsCatalog -and
+        $_.RootFolder.ServerRelativeUrl -notmatch '/_catalogs/' -and
+        ($IncludeHidden -or -not $_.Hidden -or $isPhl)
+    }
+
+    foreach ($lib in $libs) {
+        $row = New-Row -Site $Site
+        $row.WebUrl       = $WebUrl
+        $row.LibraryTitle = $lib.Title
+        $row.LibraryUrl   = $lib.RootFolder.ServerRelativeUrl
+        $row.IsPHL        = [bool]($lib.RootFolder.ServerRelativeUrl -match '/PreservationHoldLibrary$')
+        $row.Hidden       = $lib.Hidden
+        $row.ItemCount    = $lib.ItemCount
+
+        try {
+            $m = Get-PnPFolderStorageMetric -List $lib -Connection $WebConn
+            $totalBytes   = [int64]$m.TotalSize
+            $currentBytes = [int64]$m.TotalFileStreamSize
+
+            $row.FileCount         = $m.TotalFileCount
+            $row.TotalSizeGB       = [math]::Round($totalBytes / 1GB, 3)
+            $row.TotalSizeMB       = [math]::Round($totalBytes / 1MB, 2)
+            $row.CurrentFilesGB    = [math]::Round($currentBytes / 1GB, 3)
+            $row.VersionOverheadGB = [math]::Round([math]::Max([int64]0, $totalBytes - $currentBytes) / 1GB, 3)
+            $row.LastModified      = $m.LastModified
+            if ($Site.StorageUsageCurrent -gt 0) {
+                $row.PercentOfSite = [math]::Round(($totalBytes / 1MB) / $Site.StorageUsageCurrent * 100, 1)
+            }
+        }
+        catch {
+            # One broken library shouldn't kill the rest of the site
+            $row.Status = 'LibraryFailed'
+            $row.Error  = $_.Exception.Message
+        }
+
+        [pscustomobject]$row
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Helper: scan a whole site (root web + optional subsites)
+# ---------------------------------------------------------------------------
+function Get-SiteLibraryRows {
+    param([Parameter(Mandatory)] $Site)
+
+    $rootConn = Connect-SpoWeb -Url $Site.Url
+    Get-WebLibraryRows -WebConn $rootConn -WebUrl $Site.Url -Site $Site
+
+    if ($IncludeSubsites) {
+        $subWebs = Get-PnPSubWeb -Recurse -Connection $rootConn
+        foreach ($web in $subWebs) {
+            try {
+                $webConn = Connect-SpoWeb -Url $web.Url
+                Get-WebLibraryRows -WebConn $webConn -WebUrl $web.Url -Site $Site
+            }
+            catch {
+                $row = New-Row -Site $Site
+                $row.WebUrl = $web.Url
+                $row.Status = 'SubsiteFailed'
+                $row.Error  = $_.Exception.Message
+                [pscustomobject]$row
+            }
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 3. Loop sites
+# ---------------------------------------------------------------------------
+$i = 0
+$allRows = [System.Collections.Generic.List[object]]::new()
+
+foreach ($site in $sites) {
+    $i++
+    Write-Progress -Activity "Scanning document libraries" -Status "$i / $total : $($site.Url)" -PercentComplete (($i / $total) * 100)
+
+    $tempAdmin = $false
+    $rows      = @()
+
+    try {
+        try {
+            $rows = @(Get-SiteLibraryRows -Site $site)
+        }
+        catch {
+            $isDenied = $_.Exception.Message -match 'Access (is )?denied|401|403|Unauthorized'
+            if ($isDenied -and $GrantTempAdmin) {
+                Set-PnPTenantSite -Identity $site.Url -Owners $AdminUpn -Connection $adminConn
+                $tempAdmin = $true
+                Start-Sleep -Seconds 5   # let the permission apply
+                $rows = @(Get-SiteLibraryRows -Site $site)
+            }
+            else { throw }
+        }
+
+        if ($rows.Count -eq 0) {
+            $r = New-Row -Site $site
+            $r.Status = 'NoLibraries'
+            $rows = @([pscustomobject]$r)
+        }
+    }
+    catch {
+        Write-Warning "$($site.Url): $($_.Exception.Message)"
+        $r = New-Row -Site $site
+        $r.Status = 'Failed'
+        $r.Error  = $_.Exception.Message
+        $rows = @([pscustomobject]$r)
+    }
+    finally {
+        if ($tempAdmin) {
+            try {
+                $cleanupConn = Connect-SpoWeb -Url $site.Url
+                Remove-PnPSiteCollectionAdmin -Owners $AdminUpn -Connection $cleanupConn
+            }
+            catch {
+                Write-Warning "Could not remove temp admin on $($site.Url) — REMOVE MANUALLY."
+                foreach ($r in $rows) {
+                    $r.Error = "$($r.Error) | CLEANUP FAILED - remove $AdminUpn manually".Trim(' |')
+                }
+            }
+        }
+    }
+
+    foreach ($r in $rows) {
+        $r.TempAdminGranted = $tempAdmin
+        $allRows.Add($r)
+    }
+    $rows | Export-Csv -Path $OutputPath -NoTypeInformation -Append -Encoding utf8
+}
+
+Write-Progress -Activity "Scanning document libraries" -Completed
+
+# ---------------------------------------------------------------------------
+# 4. Console summary
+# ---------------------------------------------------------------------------
+$libRows   = $allRows | Where-Object { $_.LibraryTitle -and $_.TotalSizeGB -ne $null }
+$totalGB   = ($libRows | Measure-Object TotalSizeGB -Sum).Sum
+$verGB     = ($libRows | Measure-Object VersionOverheadGB -Sum).Sum
+$phlGB     = ($libRows | Where-Object IsPHL | Measure-Object TotalSizeGB -Sum).Sum
+$failed    = @($allRows | Where-Object Status -eq 'Failed').Count
+$libFailed = @($allRows | Where-Object Status -in 'LibraryFailed','SubsiteFailed').Count
+
+Write-Host ""
+Write-Host "==================== SUMMARY ====================" -ForegroundColor Green
+Write-Host ("Sites scanned              : {0}" -f $total)
+Write-Host ("Libraries measured         : {0}" -f @($libRows).Count)
+Write-Host ("Total library size (GB)    : {0:N2}" -f $totalGB)
+Write-Host ("  of which version history : {0:N2}" -f $verGB)
+Write-Host ("  of which PHL             : {0:N2}" -f $phlGB)
+Write-Host ("Failed sites               : {0}" -f $failed)
+Write-Host ("Failed libraries/subsites  : {0}" -f $libFailed)
+Write-Host ("Report                     : {0}" -f $OutputPath)
+Write-Host ""
+Write-Host "Top 15 libraries by size:" -ForegroundColor Green
+$libRows | Sort-Object TotalSizeGB -Descending | Select-Object -First 15 SiteUrl, LibraryTitle, TotalSizeGB, VersionOverheadGB, FileCount |
+    Format-Table -AutoSize | Out-Host
+
+if ($failed) {
+    Write-Host "Failed sites are in the CSV (Status = Failed). Usually: not site collection admin — re-run with -GrantTempAdmin." -ForegroundColor Yellow
+}

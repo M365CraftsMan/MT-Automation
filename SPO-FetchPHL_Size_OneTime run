@@ -1,0 +1,240 @@
+<#
+.SYNOPSIS
+    One-time report: size of the Preservation Hold Library (PHL) on every SharePoint Online site.
+.\SPO_Fetch_PHL_Size.ps1 -TenantName "enter tenant name" -ClientId "Enter client app id" -GrantTempAdmin -AdminUpn "enter admin upn"
+
+
+.DESCRIPTION
+    - Authenticates ONCE (interactive/MFA) against the SPO admin center.
+    - Pulls a SharePoint access token from that one connection and connects to every site with
+      -AccessToken, so there is NO re-prompt per site. Tokens are cached per host (tenant / tenant-my)
+      and silently refreshed every 40 minutes from the original connection.
+    - Finds the PHL by URL (/PreservationHoldLibrary), so it works on non-English sites too.
+    - Uses Get-PnPFolderStorageMetric (same numbers as storman.aspx):
+        TotalSize            = current files + version history + metadata  (what counts against quota)
+        TotalFileStreamSize  = current file versions only
+    - Writes each row to CSV as it goes, so a crash/timeout doesn't lose progress.
+
+.REQUIREMENTS
+    - PowerShell 7.4+, PnP.PowerShell 3.x
+    - Your own Entra ID app registration for PnP (the PnP Management Shell app was retired Sept 2024).
+      Create one with: Register-PnPEntraIDAppForInteractiveLogin -ApplicationName "PnP-Reporting" -Tenant contoso.onmicrosoft.com -Interactive
+      Delegated permissions needed: SharePoint > AllSites.FullControl (admin consented).
+    - Running account: SharePoint Administrator (to enumerate sites) AND site collection admin on each site
+      to read the PHL. Use -GrantTempAdmin if you're not already SCA everywhere (see below).
+
+.PARAMETER TenantName
+    Tenant prefix, e.g. "contoso" for contoso.sharepoint.com
+
+.PARAMETER ClientId
+    App (client) ID of your PnP Entra app registration.
+
+.PARAMETER IncludeOneDrive
+    Also scan OneDrive for Business sites (PHL exists there too when a hold/retention applies).
+
+.PARAMETER GrantTempAdmin
+    If access is denied on a site, temporarily add -AdminUpn as site collection admin, read the PHL,
+    then remove the admin rights again. OFF by default — check change control before using on client tenants.
+
+.PARAMETER AdminUpn
+    UPN of the running account. Required with -GrantTempAdmin.
+
+.EXAMPLE
+    ./Get-PreservationHoldLibrarySize.ps1 -TenantName contoso -ClientId 00000000-0000-0000-0000-000000000000
+
+.EXAMPLE
+    ./Get-PreservationHoldLibrarySize.ps1 -TenantName contoso -ClientId <guid> -IncludeOneDrive -GrantTempAdmin -AdminUpn ashu@contoso.com
+#>
+
+#Requires -Version 7.2
+#Requires -Modules PnP.PowerShell
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)] [string] $TenantName,
+    [Parameter(Mandatory)] [string] $ClientId,
+    [string] $OutputPath = (Join-Path $PWD "PHL_Size_Report_$($TenantName)_$(Get-Date -Format 'yyyyMMdd_HHmm').csv"),
+    [switch] $IncludeOneDrive,
+    [switch] $GrantTempAdmin,
+    [string] $AdminUpn
+)
+
+$ErrorActionPreference = 'Stop'
+
+if ($GrantTempAdmin -and -not $AdminUpn) {
+    throw "-AdminUpn is required when -GrantTempAdmin is used."
+}
+
+$adminUrl = "https://$TenantName-admin.sharepoint.com"
+
+# ---------------------------------------------------------------------------
+# 1. Single interactive sign-in
+# ---------------------------------------------------------------------------
+Write-Host "Connecting to $adminUrl (you'll be prompted once)..." -ForegroundColor Cyan
+$adminConn = Connect-PnPOnline -Url $adminUrl -ClientId $ClientId -Interactive -ReturnConnection
+
+# ---------------------------------------------------------------------------
+# 2. Enumerate sites
+# ---------------------------------------------------------------------------
+Write-Host "Enumerating sites..." -ForegroundColor Cyan
+$siteParams = @{ Connection = $adminConn }
+if ($IncludeOneDrive) { $siteParams.IncludeOneDriveSites = $true }
+
+$sites = Get-PnPTenantSite @siteParams | Where-Object {
+    $_.Template -notmatch '^(REDIRECTSITE|SRCHCEN|SPSMSITEHOST|APPCATALOG|POINTPUBLISHINGHUB|EDISC|TEAMCHANNEL)' -and
+    $_.LockState -ne 'NoAccess'
+}
+
+$total = $sites.Count
+Write-Host "Found $total sites to scan. Output: $OutputPath" -ForegroundColor Cyan
+
+# ---------------------------------------------------------------------------
+# Helper: get a SharePoint token for a host (contoso.sharepoint.com / contoso-my.sharepoint.com)
+# from the single admin connection. Cached per host, refreshed before expiry. Never prompts.
+# ---------------------------------------------------------------------------
+$tokenCache = @{}
+function Get-SpoToken {
+    param([Parameter(Mandatory)] [string] $SiteUrl)
+
+    $spoHost = ([uri]$SiteUrl).Host
+    $cached  = $tokenCache[$spoHost]
+    if ($cached -and ((Get-Date) - $cached.Acquired).TotalMinutes -lt 40) {
+        return $cached.Token
+    }
+
+    $token = Get-PnPAccessToken -ResourceUrl "https://$spoHost/.default" -Connection $adminConn
+    $tokenCache[$spoHost] = @{ Token = $token; Acquired = Get-Date }
+    return $token
+}
+
+# ---------------------------------------------------------------------------
+# Helper: read PHL metrics using a site connection
+# ---------------------------------------------------------------------------
+function Get-PHLMetrics {
+    param([Parameter(Mandatory)] $SiteConn)
+
+    $phl = Get-PnPList -Connection $SiteConn -Includes RootFolder |
+           Where-Object { $_.RootFolder.ServerRelativeUrl -match '/PreservationHoldLibrary$' } |
+           Select-Object -First 1
+
+    if (-not $phl) { return $null }
+
+    $m = Get-PnPFolderStorageMetric -List $phl -Connection $SiteConn
+    [pscustomobject]@{
+        ItemCount          = $phl.ItemCount
+        TotalFileCount     = $m.TotalFileCount
+        TotalSizeBytes     = [int64]$m.TotalSize
+        CurrentFilesBytes  = [int64]$m.TotalFileStreamSize
+        LastModified       = $m.LastModified
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 3. Loop sites — token-based connections, no re-prompt
+# ---------------------------------------------------------------------------
+$i = 0
+$summary = [System.Collections.Generic.List[object]]::new()
+
+foreach ($site in $sites) {
+    $i++
+    Write-Progress -Activity "Scanning Preservation Hold Libraries" -Status "$i / $total : $($site.Url)" -PercentComplete (($i / $total) * 100)
+
+    $row = [ordered]@{
+        SiteUrl             = $site.Url
+        Title               = $site.Title
+        Template            = $site.Template
+        SiteStorageUsedGB   = [math]::Round($site.StorageUsageCurrent / 1024, 2)   # StorageUsageCurrent is MB
+        PHLExists           = $false
+        PHLItemCount        = $null
+        PHLFileCount        = $null
+        PHLTotalSizeGB      = $null   # incl. versions — what consumes quota
+        PHLTotalSizeMB      = $null
+        PHLCurrentFilesGB   = $null   # latest versions only
+        PHLPercentOfSite    = $null
+        PHLLastModified     = $null
+        TempAdminGranted    = $false
+        Status              = 'OK'
+        Error               = $null
+    }
+
+    $siteConn = $null
+    try {
+        # Token-based connect: no auth UI, reuses the single sign-in from $adminConn
+        $siteConn = Connect-PnPOnline -Url $site.Url -AccessToken (Get-SpoToken -SiteUrl $site.Url) -ReturnConnection
+
+        try {
+            $metrics = Get-PHLMetrics -SiteConn $siteConn
+        }
+        catch {
+            $isDenied = $_.Exception.Message -match 'Access (is )?denied|401|403|Unauthorized'
+            if ($isDenied -and $GrantTempAdmin) {
+                Set-PnPTenantSite -Url $site.Url -Owners $AdminUpn -Connection $adminConn
+                $row.TempAdminGranted = $true
+                Start-Sleep -Seconds 5   # give the permission a moment to apply
+                $metrics = Get-PHLMetrics -SiteConn $siteConn
+            }
+            else { throw }
+        }
+
+        if ($metrics) {
+            $row.PHLExists         = $true
+            $row.PHLItemCount      = $metrics.ItemCount
+            $row.PHLFileCount      = $metrics.TotalFileCount
+            $row.PHLTotalSizeGB    = [math]::Round($metrics.TotalSizeBytes / 1GB, 3)
+            $row.PHLTotalSizeMB    = [math]::Round($metrics.TotalSizeBytes / 1MB, 2)
+            $row.PHLCurrentFilesGB = [math]::Round($metrics.CurrentFilesBytes / 1GB, 3)
+            $row.PHLLastModified   = $metrics.LastModified
+            if ($site.StorageUsageCurrent -gt 0) {
+                $row.PHLPercentOfSite = [math]::Round(($metrics.TotalSizeBytes / 1MB) / $site.StorageUsageCurrent * 100, 1)
+            }
+        }
+        else {
+            $row.Status = 'No PHL'
+        }
+    }
+    catch {
+        $row.Status = 'Failed'
+        $row.Error  = $_.Exception.Message
+        Write-Warning "$($site.Url): $($_.Exception.Message)"
+    }
+    finally {
+        if ($row.TempAdminGranted) {
+            try {
+                Remove-PnPSiteCollectionAdmin -Owners $AdminUpn -Connection $siteConn
+            }
+            catch {
+                $row.Error = "$($row.Error) | CLEANUP FAILED - remove $AdminUpn manually: $($_.Exception.Message)".Trim(' |')
+                Write-Warning "Could not remove temp admin on $($site.Url) — remove manually."
+            }
+        }
+    }
+
+    $obj = [pscustomobject]$row
+    $obj | Export-Csv -Path $OutputPath -NoTypeInformation -Append -Encoding utf8
+    $summary.Add($obj)
+}
+
+Write-Progress -Activity "Scanning Preservation Hold Libraries" -Completed
+
+# ---------------------------------------------------------------------------
+# 4. Console summary
+# ---------------------------------------------------------------------------
+$withPhl  = $summary | Where-Object PHLExists
+$totalGB  = ($withPhl | Measure-Object PHLTotalSizeGB -Sum).Sum
+$failed   = ($summary | Where-Object Status -eq 'Failed').Count
+
+Write-Host ""
+Write-Host "==================== SUMMARY ====================" -ForegroundColor Green
+Write-Host ("Sites scanned        : {0}" -f $total)
+Write-Host ("Sites with PHL       : {0}" -f $withPhl.Count)
+Write-Host ("Total PHL size (GB)  : {0:N2}" -f $totalGB)
+Write-Host ("Failed sites         : {0}" -f $failed)
+Write-Host ("Report               : {0}" -f $OutputPath)
+Write-Host ""
+Write-Host "Top 10 sites by PHL size:" -ForegroundColor Green
+$withPhl | Sort-Object PHLTotalSizeGB -Descending | Select-Object -First 10 SiteUrl, PHLTotalSizeGB, PHLFileCount, PHLPercentOfSite |
+    Format-Table -AutoSize
+
+if ($failed) {
+    Write-Host "Failed sites are in the CSV (Status = Failed). Most common cause: not site collection admin — re-run with -GrantTempAdmin." -ForegroundColor Yellow
+}

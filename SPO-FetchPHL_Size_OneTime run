@@ -102,7 +102,10 @@ function Get-SpoToken {
         return $cached.Token
     }
 
-    $token = Get-PnPAccessToken -ResourceUrl "https://$spoHost/.default" -Connection $adminConn
+    $jwt   = Get-PnPAccessToken -ResourceUrl "https://$spoHost/.default" -Decoded -Connection $adminConn
+    $token = $jwt.EncodedToken
+    if ([string]::IsNullOrWhiteSpace($token)) { throw "Could not acquire SharePoint token for $spoHost" }
+    #$token = Get-PnPAccessToken -ResourceUrl "https://$spoHost/.default" -Connection $adminConn
     $tokenCache[$spoHost] = @{ Token = $token; Acquired = Get-Date }
     return $token
 }

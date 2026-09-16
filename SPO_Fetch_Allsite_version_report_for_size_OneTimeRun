@@ -1,0 +1,429 @@
+<#
+.SYNOPSIS
+    One-time report: per-file current size vs space consumed by previous versions, across all SPO sites.
+
+.\SPO_Fetch_Allsite_version_report_for_size.ps1 -TenantName "" -ClientId "" -MinTotalSizeMB 10 -GrantTempAdmin:$true -AdminUpn ""
+
+.DESCRIPTION
+    Same auth model as the other scripts: ONE interactive sign-in, then token-based connections
+    to every site/subsite (no re-prompt). Token helper works on PnP 2.x and 3.x.
+
+    How sizes are measured (fast mode, default):
+      Every document library is read in pages of 2,000 items with only the needed columns:
+        File_x0020_Size  = current version size
+        SMTotalSize      = storage metric: current + all previous versions (+ small metadata overhead)
+      PreviousVersionsMB = SMTotalSize - File_x0020_Size
+      Cost: ~1 request per 2,000 files. Suitable for whole-tenant runs.
+
+    Exact mode (-IncludeVersionCount):
+      For each file that HAS version overhead, also calls Get-PnPFileVersion to get the exact version
+      count and summed version size. Cost: +1 request per such file. Use with -SiteUrls, not tenant-wide.
+
+    Outputs (in -OutputFolder):
+      Files.csv            one row per file (filtered by -MinTotalSizeMB)
+      LibrarySummary.csv   one row per library: file count, current GB, previous versions GB
+      Errors.csv           sites/libraries that failed
+      SitesCompleted.txt   resume marker — re-run with the same -OutputFolder to skip finished sites
+
+.REQUIREMENTS
+    - PowerShell 7.4+, PnP.PowerShell 3.x
+    - Entra app registration (delegated SharePoint AllSites.FullControl, admin consented)
+    - SharePoint Administrator + site collection admin on each site (or -GrantTempAdmin)
+
+.PARAMETER TenantName       Tenant prefix, e.g. "contoso"
+.PARAMETER ClientId         App (client) ID of your PnP Entra app registration
+.PARAMETER SiteUrls         Only scan these sites (use for testing)
+.PARAMETER OutputFolder     Where CSVs go. Re-use the same folder to resume an interrupted run.
+.PARAMETER MinTotalSizeMB   Only write files whose total size (incl. versions) >= this to Files.csv.
+                            Library summary still counts ALL files. Default 0 (every file).
+.PARAMETER IncludeVersionCount  Exact version count + exact version bytes per file (slow).
+.PARAMETER IncludeSubsites  Also scan subsites.
+.PARAMETER IncludeHidden    Include hidden libraries.
+.PARAMETER IncludePHL       Include the Preservation Hold Library (excluded by default).
+.PARAMETER IncludeOneDrive  Also scan OneDrive sites.
+.PARAMETER GrantTempAdmin   On access denied, temporarily add -AdminUpn as SCA, scan, remove.
+.PARAMETER AdminUpn         Required with -GrantTempAdmin.
+
+.EXAMPLE
+    # Test run on one site, exact version counts
+    ./Get-SPOVersionStorageReport.ps1 -TenantName contoso -ClientId <guid> -SiteUrls "https://contoso.sharepoint.com/sites/HR" -IncludeVersionCount
+
+.EXAMPLE
+    # Whole tenant, only list files >= 10 MB in Files.csv
+    ./Get-SPOVersionStorageReport.ps1 -TenantName contoso -ClientId <guid> -MinTotalSizeMB 10
+
+.EXAMPLE
+    # Resume after interruption
+    ./Get-SPOVersionStorageReport.ps1 -TenantName contoso -ClientId <guid> -MinTotalSizeMB 10 -OutputFolder .\SPO_VersionStorage_contoso_20260916_2000
+#>
+
+#Requires -Version 7.2
+#Requires -Modules PnP.PowerShell
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)] [string] $TenantName,
+    [Parameter(Mandatory)] [string] $ClientId,
+    [string[]] $SiteUrls,
+    [string]   $OutputFolder = (Join-Path $PWD "SPO_VersionStorage_$($TenantName)_$(Get-Date -Format 'yyyyMMdd_HHmm')"),
+    [double]   $MinTotalSizeMB = 0,
+    [switch]   $IncludeVersionCount,
+    [switch]   $IncludeSubsites,
+    [switch]   $IncludeHidden,
+    [switch]   $IncludePHL,
+    [switch]   $IncludeOneDrive,
+    [switch]   $GrantTempAdmin,
+    [string]   $AdminUpn
+)
+
+$ErrorActionPreference = 'Stop'
+
+if ($GrantTempAdmin -and -not $AdminUpn) { throw "-AdminUpn is required when -GrantTempAdmin is used." }
+
+New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
+$filesCsv     = Join-Path $OutputFolder 'Files.csv'
+$summaryCsv   = Join-Path $OutputFolder 'LibrarySummary.csv'
+$errorsCsv    = Join-Path $OutputFolder 'Errors.csv'
+$completedTxt = Join-Path $OutputFolder 'SitesCompleted.txt'
+
+$completed = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+if (Test-Path $completedTxt) {
+    Get-Content $completedTxt | Where-Object { $_ } | ForEach-Object { [void]$completed.Add($_.Trim()) }
+    Write-Host "Resuming: $($completed.Count) sites already completed will be skipped." -ForegroundColor Yellow
+}
+
+$adminUrl = "https://$TenantName-admin.sharepoint.com"
+
+# ---------------------------------------------------------------------------
+# 1. Single interactive sign-in
+# ---------------------------------------------------------------------------
+Write-Host "Connecting to $adminUrl (you'll be prompted once)..." -ForegroundColor Cyan
+$adminConn = Connect-PnPOnline -Url $adminUrl -ClientId $ClientId -Interactive -ReturnConnection
+
+# ---------------------------------------------------------------------------
+# 2. Enumerate sites
+# ---------------------------------------------------------------------------
+Write-Host "Enumerating sites..." -ForegroundColor Cyan
+$siteParams = @{ Connection = $adminConn }
+if ($IncludeOneDrive) { $siteParams.IncludeOneDriveSites = $true }
+
+$sites = Get-PnPTenantSite @siteParams | Where-Object {
+    $_.Template -notmatch '^(REDIRECTSITE|SRCHCEN|SPSMSITEHOST|APPCATALOG|POINTPUBLISHINGHUB|EDISC|TEAMCHANNEL)' -and
+    $_.LockState -ne 'NoAccess'
+}
+if ($SiteUrls) {
+    $wanted = $SiteUrls | ForEach-Object { $_.TrimEnd('/').ToLowerInvariant() }
+    $sites  = $sites | Where-Object { $wanted -contains $_.Url.TrimEnd('/').ToLowerInvariant() }
+}
+$sites = @($sites | Where-Object { -not $completed.Contains($_.Url) })
+
+$total = $sites.Count
+Write-Host "Sites to scan: $total. Output folder: $OutputFolder" -ForegroundColor Cyan
+
+# ---------------------------------------------------------------------------
+# Token helpers (PnP 2.x + 3.x). Cached per host, refreshed at 30 min.
+# ---------------------------------------------------------------------------
+$tokenCache = @{}
+function Get-SpoToken {
+    param([Parameter(Mandatory)] [string] $SiteUrl, [switch] $Force)
+    $spoHost = ([uri]$SiteUrl).Host
+    $cached  = $tokenCache[$spoHost]
+    if (-not $Force -and $cached -and ((Get-Date) - $cached.Acquired).TotalMinutes -lt 30) { return $cached.Token }
+    $token = Get-RawSpoToken -Resource "https://$spoHost/.default"
+    $tokenCache[$spoHost] = @{ Token = $token; Acquired = Get-Date }
+    return $token
+}
+
+function Get-RawSpoToken {
+    param([Parameter(Mandatory)] [string] $Resource)
+    $plainError = $null
+    try {
+        $t = Get-PnPAccessToken -ResourceUrl $Resource -Connection $adminConn
+        if ($t -is [string] -and -not [string]::IsNullOrWhiteSpace($t)) { return $t }
+    }
+    catch { $plainError = $_.Exception.Message }
+
+    $jwt = Get-PnPAccessToken -ResourceUrl $Resource -Decoded -Connection $adminConn
+    foreach ($prop in 'EncodedToken', 'RawData') {
+        if ($jwt.PSObject.Properties[$prop] -and -not [string]::IsNullOrWhiteSpace($jwt.$prop)) { return [string]$jwt.$prop }
+    }
+    $type = if ($jwt) { $jwt.GetType().FullName } else { 'null' }
+    throw "Could not acquire token for $Resource (decoded type: $type; plain call error: $plainError)"
+}
+
+function Connect-SpoWeb {
+    param([Parameter(Mandatory)] [string] $Url, [switch] $ForceNewToken)
+    Connect-PnPOnline -Url $Url -AccessToken (Get-SpoToken -SiteUrl $Url -Force:$ForceNewToken) -ReturnConnection
+}
+
+# ---------------------------------------------------------------------------
+# Value helpers
+# ---------------------------------------------------------------------------
+function ConvertTo-Bytes {
+    # Handles string, number, FieldLookupValue (SMTotalSize is a lookup), null
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value.PSObject.Properties['LookupValue']) { $Value = $Value.LookupValue }
+    $n = 0L
+    if ([int64]::TryParse([string]$Value, [ref]$n)) { return $n }
+    $d = 0.0
+    if ([double]::TryParse([string]$Value, [System.Globalization.NumberStyles]::Any, [cultureinfo]::InvariantCulture, [ref]$d)) { return [int64]$d }
+    return $null
+}
+
+function Get-UserText {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value.PSObject.Properties['Email'] -and $Value.Email) { return $Value.Email }
+    if ($Value.PSObject.Properties['LookupValue']) { return $Value.LookupValue }
+    return [string]$Value
+}
+
+function Write-Buffered {
+    param([System.Collections.Generic.List[object]] $Buffer, [string] $Path)
+    if ($Buffer.Count -gt 0) {
+        $Buffer | Export-Csv -Path $Path -NoTypeInformation -Append -Encoding utf8
+        $Buffer.Clear()
+    }
+}
+
+function Add-ErrorRow {
+    param([string] $SiteUrl, [string] $WebUrl, [string] $Library, [string] $Message)
+    [pscustomobject]@{
+        Time = Get-Date; SiteUrl = $SiteUrl; WebUrl = $WebUrl; Library = $Library; Error = $Message
+    } | Export-Csv -Path $errorsCsv -NoTypeInformation -Append -Encoding utf8
+}
+
+$MB = 1MB
+$GB = 1GB
+
+# ---------------------------------------------------------------------------
+# Scan one library -> file rows buffered in memory, flushed at end of library
+# (per-library buffering means a token-expiry retry never writes duplicate rows)
+# ---------------------------------------------------------------------------
+function Invoke-LibraryScan {
+    param(
+        [Parameter(Mandatory)] $WebConn,
+        [Parameter(Mandatory)] [string] $WebUrl,
+        [Parameter(Mandatory)] $Site,
+        [Parameter(Mandatory)] $Library
+    )
+
+    $fields = 'FileLeafRef', 'FileRef', 'File_x0020_Size', 'SMTotalSize', '_UIVersionString', 'Modified', 'Editor', 'FSObjType'
+
+    $fileRows      = [System.Collections.Generic.List[object]]::new()
+    $fileCount     = 0L
+    $currentBytes  = 0L
+    $totalBytes    = 0L
+    $noMetricCount = 0L
+    $filesWithVer  = 0L
+
+    Get-PnPListItem -List $Library -PageSize 2000 -Fields $fields -Connection $WebConn | ForEach-Object {
+        $fv = $_.FieldValues
+        if ([string]$fv['FSObjType'] -ne '0') { return }   # skip folders
+
+        $fileCount++
+        $cur = ConvertTo-Bytes $fv['File_x0020_Size']
+        $tot = ConvertTo-Bytes $fv['SMTotalSize']
+
+        if ($null -eq $cur) { $cur = 0L }
+        if ($null -eq $tot) {
+            # Storage metrics not yet calculated (typically brand-new uploads)
+            $noMetricCount++
+            $tot = $cur
+            $metricStatus = 'NoStorageMetric'
+        }
+        else { $metricStatus = 'OK' }
+
+        $prev = [math]::Max([int64]0, $tot - $cur)
+        $currentBytes += $cur
+        $totalBytes   += $tot
+        if ($prev -gt 0) { $filesWithVer++ }
+
+        if (($tot / $MB) -ge $MinTotalSizeMB) {
+            $fileRef = [string]$fv['FileRef']
+            $row = [ordered]@{
+                SiteUrl              = $Site.Url
+                WebUrl               = $WebUrl
+                Library              = $Library.Title
+                FileName             = [string]$fv['FileLeafRef']
+                FileUrl              = $fileRef
+                Extension            = [System.IO.Path]::GetExtension([string]$fv['FileLeafRef']).TrimStart('.').ToLowerInvariant()
+                CurrentVersion       = [string]$fv['_UIVersionString']
+                CurrentSizeMB        = [math]::Round($cur / $MB, 3)
+                PreviousVersionsMB   = [math]::Round($prev / $MB, 3)
+                TotalSizeMB          = [math]::Round($tot / $MB, 3)
+                VersionsToFileRatio  = if ($cur -gt 0) { [math]::Round($prev / $cur, 2) } else { $null }
+                VersionCount         = $null
+                ExactVersionsMB      = $null
+                Modified             = $fv['Modified']
+                ModifiedBy           = Get-UserText $fv['Editor']
+                MetricStatus         = $metricStatus
+            }
+
+            if ($IncludeVersionCount -and $prev -gt 0) {
+                try {
+                    $versions = @(Get-PnPFileVersion -Url $fileRef -Connection $WebConn)
+                    $row.VersionCount = $versions.Count
+                    $vBytes = 0L
+                    foreach ($v in $versions) {
+                        $len = if ($v.PSObject.Properties['Length'] -and $v.Length) { [int64]$v.Length } else { [int64]$v.Size }
+                        $vBytes += $len
+                    }
+                    $row.ExactVersionsMB = [math]::Round($vBytes / $MB, 3)
+                }
+                catch { $row.MetricStatus = "VersionLookupFailed: $($_.Exception.Message)" }
+            }
+
+            $fileRows.Add([pscustomobject]$row)
+        }
+    }
+
+    # Flush file rows for this library in chunks
+    $chunk = [System.Collections.Generic.List[object]]::new()
+    foreach ($r in $fileRows) {
+        $chunk.Add($r)
+        if ($chunk.Count -ge 5000) { Write-Buffered -Buffer $chunk -Path $filesCsv }
+    }
+    Write-Buffered -Buffer $chunk -Path $filesCsv
+
+    [pscustomobject]@{
+        SiteUrl             = $Site.Url
+        WebUrl              = $WebUrl
+        Library             = $Library.Title
+        LibraryUrl          = $Library.RootFolder.ServerRelativeUrl
+        FileCount           = $fileCount
+        FilesWithVersions   = $filesWithVer
+        CurrentFilesGB      = [math]::Round($currentBytes / $GB, 3)
+        PreviousVersionsGB  = [math]::Round([math]::Max([int64]0, $totalBytes - $currentBytes) / $GB, 3)
+        TotalGB             = [math]::Round($totalBytes / $GB, 3)
+        VersionsPercent     = if ($totalBytes -gt 0) { [math]::Round((($totalBytes - $currentBytes) / $totalBytes) * 100, 1) } else { 0 }
+        FilesNoStorageMetric = $noMetricCount
+        FileRowsWritten     = $fileRows.Count
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Scan one web (all eligible libraries)
+# ---------------------------------------------------------------------------
+function Invoke-WebScan {
+    param([Parameter(Mandatory)] [string] $WebUrl, [Parameter(Mandatory)] $Site)
+
+    $webConn = Connect-SpoWeb -Url $WebUrl
+    $lists   = Get-PnPList -Connection $webConn -Includes RootFolder, ItemCount, BaseType, IsCatalog
+
+    $libs = @($lists | Where-Object {
+        $isPhl = $_.RootFolder.ServerRelativeUrl -match '/PreservationHoldLibrary$'
+        $_.BaseType -eq 'DocumentLibrary' -and
+        -not $_.IsCatalog -and
+        $_.RootFolder.ServerRelativeUrl -notmatch '/_catalogs/' -and
+        $_.ItemCount -gt 0 -and
+        ($IncludePHL -or -not $isPhl) -and
+        ($IncludeHidden -or -not $_.Hidden -or ($IncludePHL -and $isPhl))
+    })
+
+    foreach ($lib in $libs) {
+        Write-Progress -Id 2 -ParentId 1 -Activity "Library" -Status "$($lib.Title) ($($lib.ItemCount) items)"
+        try {
+            $summary = Invoke-LibraryScan -WebConn $webConn -WebUrl $WebUrl -Site $Site -Library $lib
+        }
+        catch {
+            if ($_.Exception.Message -match '401|Unauthorized|expired') {
+                # Token expired mid-library: fresh token, reconnect, retry once
+                $webConn = Connect-SpoWeb -Url $WebUrl -ForceNewToken
+                $summary = Invoke-LibraryScan -WebConn $webConn -WebUrl $WebUrl -Site $Site -Library $lib
+            }
+            else {
+                Add-ErrorRow -SiteUrl $Site.Url -WebUrl $WebUrl -Library $lib.Title -Message $_.Exception.Message
+                continue
+            }
+        }
+        $summary | Export-Csv -Path $summaryCsv -NoTypeInformation -Append -Encoding utf8
+        $summary
+    }
+
+    if ($IncludeSubsites -and $WebUrl -eq $Site.Url) {
+        foreach ($web in @(Get-PnPSubWeb -Recurse -Connection $webConn)) {
+            try { Invoke-WebScan -WebUrl $web.Url -Site $Site }
+            catch { Add-ErrorRow -SiteUrl $Site.Url -WebUrl $web.Url -Library '' -Message $_.Exception.Message }
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 3. Loop sites
+# ---------------------------------------------------------------------------
+$i = 0
+$allSummaries = [System.Collections.Generic.List[object]]::new()
+$failedSites  = 0
+$started      = Get-Date
+
+foreach ($site in $sites) {
+    $i++
+    $elapsed = (Get-Date) - $started
+    $eta = if ($i -gt 1) { [timespan]::FromSeconds($elapsed.TotalSeconds / ($i - 1) * ($total - $i + 1)).ToString('hh\:mm\:ss') } else { '--' }
+    Write-Progress -Id 1 -Activity "Version storage report" -Status "$i / $total : $($site.Url)  (ETA $eta)" -PercentComplete (($i / [math]::Max(1,$total)) * 100)
+
+    $tempAdmin = $false
+    try {
+        try {
+            $res = @(Invoke-WebScan -WebUrl $site.Url -Site $site)
+        }
+        catch {
+            if ($_.Exception.Message -match 'Access (is )?denied|401|403|Unauthorized' -and $GrantTempAdmin) {
+                Set-PnPTenantSite -Identity $site.Url -Owners $AdminUpn -Connection $adminConn
+                $tempAdmin = $true
+                Start-Sleep -Seconds 5
+                $res = @(Invoke-WebScan -WebUrl $site.Url -Site $site)
+            }
+            else { throw }
+        }
+        foreach ($r in $res) { if ($r -and $r.PSObject.Properties['TotalGB']) { $allSummaries.Add($r) } }
+        Add-Content -Path $completedTxt -Value $site.Url
+    }
+    catch {
+        $failedSites++
+        Write-Warning "$($site.Url): $($_.Exception.Message)"
+        Add-ErrorRow -SiteUrl $site.Url -WebUrl $site.Url -Library '' -Message $_.Exception.Message
+    }
+    finally {
+        if ($tempAdmin) {
+            try {
+                Remove-PnPSiteCollectionAdmin -Owners $AdminUpn -Connection (Connect-SpoWeb -Url $site.Url)
+            }
+            catch {
+                Write-Warning "Could not remove temp admin on $($site.Url) — REMOVE MANUALLY."
+                Add-ErrorRow -SiteUrl $site.Url -WebUrl $site.Url -Library '' -Message "CLEANUP FAILED - remove $AdminUpn manually: $($_.Exception.Message)"
+            }
+        }
+    }
+}
+
+Write-Progress -Id 2 -Activity "Library" -Completed
+Write-Progress -Id 1 -Activity "Version storage report" -Completed
+
+# ---------------------------------------------------------------------------
+# 4. Console summary (this run only)
+# ---------------------------------------------------------------------------
+$curGB  = ($allSummaries | Measure-Object CurrentFilesGB -Sum).Sum
+$verGB  = ($allSummaries | Measure-Object PreviousVersionsGB -Sum).Sum
+$files  = ($allSummaries | Measure-Object FileCount -Sum).Sum
+$totGB  = $curGB + $verGB
+
+Write-Host ""
+Write-Host "==================== SUMMARY (this run) ====================" -ForegroundColor Green
+Write-Host ("Sites scanned            : {0}  (failed: {1})" -f $total, $failedSites)
+Write-Host ("Libraries scanned        : {0}" -f $allSummaries.Count)
+Write-Host ("Files                    : {0:N0}" -f $files)
+Write-Host ("Current files (GB)       : {0:N2}" -f $curGB)
+Write-Host ("Previous versions (GB)   : {0:N2}  ({1:N1}% of total)" -f $verGB, $(if ($totGB) { $verGB / $totGB * 100 } else { 0 }))
+Write-Host ("Duration                 : {0}" -f ((Get-Date) - $started).ToString('hh\:mm\:ss'))
+Write-Host ("Output folder            : {0}" -f $OutputFolder)
+Write-Host ""
+Write-Host "Top 10 libraries by previous-version storage:" -ForegroundColor Green
+$allSummaries | Sort-Object PreviousVersionsGB -Descending | Select-Object -First 10 SiteUrl, Library, CurrentFilesGB, PreviousVersionsGB, VersionsPercent |
+    Format-Table -AutoSize | Out-Host
+
+if ($failedSites -or (Test-Path $errorsCsv)) {
+    Write-Host "Some sites/libraries failed — see Errors.csv. Re-run with the same -OutputFolder to retry only unfinished sites." -ForegroundColor Yellow
+}

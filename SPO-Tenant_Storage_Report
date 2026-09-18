@@ -1,0 +1,347 @@
+<#
+.SYNOPSIS
+    [Runbook 13] Tenant-wide SharePoint Online site inventory report.
+    PnP.PowerShell v3.x, Azure Automation managed identity, CSV emailed via
+    Microsoft Graph sendMail.
+
+.DESCRIPTION
+    Pulls every site collection in the tenant with Get-PnPTenantSite -Detailed
+    (one tenant-level call - no per-site connections, unlike Runbook 8) and
+    reports, per site:
+
+      Url, Title, Template, SiteType, Owner, M365 Group / Teams connection,
+      Hub association, storage used / quota / % used, last content modified,
+      days inactive, sharing capability, lock state, sensitivity label,
+      subsite count, archive status.
+
+    Each row gets a Flags column (empty = nothing notable):
+      Storage-Near-Quota   % used >= $StorageWarnPercent
+      Inactive             no content change in >= $InactiveDays days
+      No-Owner             no primary owner recorded on the site
+      Anyone-Links         SharingCapability = ExternalUserAndGuestSharing
+      Locked               LockState is not "Unlock" (NoAccess / ReadOnly)
+    Rows are sorted flagged-first, then by storage used, so the top of the
+    CSV is what needs attention.
+
+    The email body is an HTML summary (totals, flag counts, top N sites by
+    storage). The full inventory is attached as CSV - or as a ZIP of that CSV
+    when it gets large, so the Graph sendMail request stays under its ~4 MB
+    inline-attachment limit on big tenants.
+
+.NOTES
+    RUNTIME - READ FIRST
+      PnP.PowerShell 3.x requires PowerShell 7.4.6+. The classic 7.2 runtime
+      and Azure Automation's 7.4 runtime (7.4.0) do NOT satisfy that, which is
+      why Runbook 8 is pinned to 2.12.0. Azure Automation made PowerShell 7.6
+      GA in July 2026 - create a Runtime Environment on PowerShell 7.6, import
+      PnP.PowerShell 3.x into THAT environment, and link this runbook to it.
+      The pre-flight check below fails fast with a clear message if the
+      runbook lands on the wrong runtime, instead of a cryptic Import-Module
+      error. PnP's own Azure Automation doc still only mentions 7.2 / 2.12.0,
+      so the first run on 7.6 is the real confirmation.
+
+    Managed identity needs:
+      SharePoint Administrator directory role   (same as Runbooks 2 and 8)
+      Mail.Send Graph application permission    (already granted)
+    No new CR scope.
+
+    Module dependencies: PnP.PowerShell only. Email goes out via a Graph token
+    taken straight from the Automation sandbox's managed-identity endpoint
+    (same approach as Runbook 10) - deliberately NOT Connect-MgGraph, because
+    loading Microsoft.Graph.Authentication and PnP.PowerShell 3.x in the same
+    session is a known source of MSAL/Azure.Core assembly conflicts.
+
+    Send-ReportEmail is inlined - no $PSScriptRoot dot-source, so this is safe
+    to paste straight into the runbook editor.
+
+    Do not move this file by pasting through Teams/Outlook (smart quotes break
+    the parser). Upload the .ps1 via Import a runbook instead.
+#>
+
+# ===================== CONFIG =====================
+$TenantAdminUrl        = "https://contoso-admin.sharepoint.com"   # EDIT
+$IncludeOneDriveSites  = $false                                    # EDIT - $true adds every user's OneDrive (large tenants: thousands of rows)
+$ExcludeSystemSites    = $true                                     # skip app catalog, redirect sites, search centre, etc.
+$ExcludedUrlPatterns   = @()                                       # EDIT - optional wildcards, e.g. "*/sites/test-*"
+$StorageWarnPercent    = 85                                        # flag sites at/above this % of their quota
+$InactiveDays          = 180                                       # flag sites with no content change in this many days
+$TopSitesInEmail       = 10                                        # top N by storage shown in the email body
+$ZipAttachmentOverMB   = 2.5                                       # zip the CSV above this size (Graph inline attachment cap ~3-4 MB after base64)
+$SenderMailbox         = "m365-audits@yourtenant.com"              # EDIT - must be covered by the Mail.Send application access policy
+$ReportRecipients      = @("secops@yourtenant.com")                # EDIT
+$ClientName            = "Contoso"                                 # EDIT - used in the email subject
+# ==================================================
+
+$ErrorActionPreference = "Stop"
+
+$systemTemplates = @(
+    'REDIRECTSITE#0', 'APPCATALOG#0', 'SRCHCEN#0', 'SPSMSITEHOST#0',
+    'EDISC#0', 'POINTPUBLISHINGHUB#0', 'POINTPUBLISHINGTOPIC#0',
+    'POINTPUBLISHINGPERSONAL#0', 'TENANTADMIN#0'
+)
+
+# ---------------- Pre-flight: runtime / module check ----------------
+$psVer = $PSVersionTable.PSVersion
+$pnp   = Get-Module -ListAvailable -Name PnP.PowerShell | Sort-Object Version -Descending | Select-Object -First 1
+if (-not $pnp) {
+    throw "PnP.PowerShell is not available in this runtime. Import PnP.PowerShell 3.x into the PowerShell 7.6 Runtime Environment this runbook is linked to."
+}
+if ($pnp.Version.Major -ge 3 -and $psVer -lt [version]"7.4.6") {
+    throw "PnP.PowerShell $($pnp.Version) needs PowerShell 7.4.6+, but this job is running on $psVer. Link the runbook to a PowerShell 7.6 Runtime Environment (7.2 and Azure Automation's 7.4.0 are both too old for PnP 3.x)."
+}
+Write-Output "Runtime: PowerShell $psVer | PnP.PowerShell $($pnp.Version)"
+Import-Module PnP.PowerShell -RequiredVersion $pnp.Version
+
+# ---------------- Helpers ----------------
+function Get-ManagedIdentityToken {
+    param([Parameter(Mandatory = $true)][string]$Resource)
+    $identityEndpoint = $env:IDENTITY_ENDPOINT
+    $identityHeader   = $env:IDENTITY_HEADER
+    if (-not $identityEndpoint -or -not $identityHeader) {
+        throw "IDENTITY_ENDPOINT/IDENTITY_HEADER not present - this only works inside an Azure Automation sandbox with the system-assigned managed identity enabled."
+    }
+    $uri  = "$identityEndpoint`?resource=$([uri]::EscapeDataString($Resource))&api-version=2019-08-01"
+    $resp = Invoke-RestMethod -Uri $uri -Headers @{ "X-IDENTITY-HEADER" = $identityHeader } -Method GET
+    return $resp.access_token
+}
+
+function Get-SiteProp {
+    # Reads the first property name that exists on the object. Protects the
+    # report from property-name drift between PnP versions (a renamed or
+    # missing property becomes a blank cell, not a failed run).
+    param($Object, [string[]]$Names)
+    foreach ($n in $Names) {
+        $p = $Object.PSObject.Properties[$n]
+        if ($p -and $null -ne $p.Value -and "$($p.Value)" -ne "") { return $p.Value }
+    }
+    return $null
+}
+
+function Get-SiteType {
+    param($Site, [string]$Template, $GroupId, $IsTeams)
+    $hasGroup = $GroupId -and "$GroupId" -ne "00000000-0000-0000-0000-000000000000"
+    if ($Site.Url -like '*-my.sharepoint.com/personal/*') { return "OneDrive" }
+    if ($Template -like 'TEAMCHANNEL#*')                   { return "Teams Channel (Private/Shared)" }
+    if ($hasGroup -and $IsTeams)                           { return "Team site (Teams-connected)" }
+    if ($hasGroup)                                         { return "Team site (M365 Group)" }
+    if ($Template -eq 'SITEPAGEPUBLISHING#0')              { return "Communication site" }
+    if ($Template -eq 'STS#3')                             { return "Team site (no group)" }
+    if ($Template -like 'STS#*' -or $Template -like 'BLANKINTERNET*') { return "Classic site" }
+    return "Other"
+}
+
+function Send-ReportEmail {
+    param(
+        [Parameter(Mandatory = $true)][string]$SenderMailbox,
+        [Parameter(Mandatory = $true)][string[]]$Recipients,
+        [Parameter(Mandatory = $true)][string]$Subject,
+        [Parameter(Mandatory = $true)][string]$BodyHtml,
+        [Parameter(Mandatory = $true)][string]$AttachmentPath,
+        [Parameter(Mandatory = $true)][string]$AccessToken
+    )
+
+    if (-not (Test-Path $AttachmentPath)) { throw "Attachment not found: $AttachmentPath" }
+
+    $fileName    = Split-Path $AttachmentPath -Leaf
+    $contentType = if ($fileName -like '*.zip') { "application/zip" } else { "text/csv" }
+    $base64      = [System.Convert]::ToBase64String([System.IO.File]::ReadAllBytes($AttachmentPath))
+
+    $message = @{
+        message = @{
+            subject      = $Subject
+            body         = @{ contentType = "HTML"; content = $BodyHtml }
+            toRecipients = @($Recipients | ForEach-Object { @{ emailAddress = @{ address = $_ } } })
+            attachments  = @(
+                @{
+                    "@odata.type" = "#microsoft.graph.fileAttachment"
+                    name          = $fileName
+                    contentType   = $contentType
+                    contentBytes  = $base64
+                }
+            )
+        }
+        saveToSentItems = $false
+    }
+    $bodyJson = $message | ConvertTo-Json -Depth 10
+
+    $uri     = "https://graph.microsoft.com/v1.0/users/$SenderMailbox/sendMail"
+    $headers = @{ Authorization = "Bearer $AccessToken" }
+    $attempt = 0
+    while ($true) {
+        try {
+            Invoke-RestMethod -Method POST -Uri $uri -Headers $headers -Body ([System.Text.Encoding]::UTF8.GetBytes($bodyJson)) -ContentType "application/json; charset=utf-8" | Out-Null
+            break
+        }
+        catch {
+            $attempt++
+            $status = $null
+            if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+            if ($status -in 429, 503, 504 -and $attempt -le 4) {
+                $wait = [math]::Min(60, [math]::Pow(2, $attempt))
+                Write-Warning "sendMail returned $status (attempt $attempt/4) - retrying in $wait s."
+                Start-Sleep -Seconds $wait
+                continue
+            }
+            throw "sendMail failed (HTTP $status): $($_.Exception.Message). Check Mail.Send on the MI and that $SenderMailbox is inside the application access policy scope."
+        }
+    }
+    Write-Output "Email sent to: $($Recipients -join ', ') with attachment $fileName"
+}
+
+function ConvertTo-HtmlSafe { param($Value) return [System.Net.WebUtility]::HtmlEncode("$Value") }
+
+# ---------------- Connect + collect ----------------
+Connect-PnPOnline -Url $TenantAdminUrl -ManagedIdentity
+
+Write-Output "Enumerating site collections (Get-PnPTenantSite -Detailed - can take a few minutes on large tenants)..."
+$getParams = @{ Detailed = $true }
+if ($IncludeOneDriveSites) { $getParams.IncludeOneDriveSites = $true }
+$sites = @(Get-PnPTenantSite @getParams)
+Write-Output "Retrieved $($sites.Count) site(s)."
+
+if ($ExcludeSystemSites) {
+    $sites = @($sites | Where-Object { $systemTemplates -notcontains $_.Template })
+}
+foreach ($pattern in $ExcludedUrlPatterns) {
+    $sites = @($sites | Where-Object { $_.Url -notlike $pattern })
+}
+Write-Output "$($sites.Count) site(s) in scope after exclusions."
+
+if ($sites.Count -eq 0) {
+    throw "No sites returned. If the tenant has sites, the MI is most likely missing the SharePoint Administrator role (or the grant hasn't propagated yet)."
+}
+
+$now     = Get-Date
+$results = New-Object System.Collections.Generic.List[object]
+
+foreach ($site in $sites) {
+    $template   = "$(Get-SiteProp $site @('Template'))"
+    $groupId    = Get-SiteProp $site @('GroupId')
+    $isTeams    = [bool](Get-SiteProp $site @('IsTeamsConnected'))
+    $usedMB     = [double](Get-SiteProp $site @('StorageUsageCurrent', 'StorageUsage'))
+    $quotaMB    = [double](Get-SiteProp $site @('StorageQuota', 'StorageMaximumLevel'))
+    $lastMod    = Get-SiteProp $site @('LastContentModifiedDate')
+    $owner      = Get-SiteProp $site @('OwnerEmail', 'Owner', 'OwnerLoginName')
+    $ownerName  = Get-SiteProp $site @('OwnerName')
+    $sharing    = "$(Get-SiteProp $site @('SharingCapability'))"
+    $lockState  = "$(Get-SiteProp $site @('LockState'))"
+    $hubSiteId  = Get-SiteProp $site @('HubSiteId')
+    $isHub      = [bool](Get-SiteProp $site @('IsHubSite'))
+
+    $pctUsed = if ($quotaMB -gt 0) { [math]::Round(($usedMB / $quotaMB) * 100, 1) } else { $null }
+
+    $daysInactive = $null
+    $lastModText  = ""
+    if ($lastMod) {
+        $lastModDt = [datetime]$lastMod
+        # SPO returns DateTime.MinValue for sites that have never been written to
+        if ($lastModDt.Year -gt 1900) {
+            $daysInactive = [int]($now - $lastModDt).TotalDays
+            $lastModText  = $lastModDt.ToString("yyyy-MM-dd")
+        }
+    }
+
+    $hubText = if ($isHub) { "Hub site" }
+               elseif ($hubSiteId -and "$hubSiteId" -ne "00000000-0000-0000-0000-000000000000") { "Associated" }
+               else { "" }
+
+    $flags = New-Object System.Collections.Generic.List[string]
+    if ($null -ne $pctUsed -and $pctUsed -ge $StorageWarnPercent)          { $flags.Add("Storage-Near-Quota") }
+    if ($null -ne $daysInactive -and $daysInactive -ge $InactiveDays)      { $flags.Add("Inactive") }
+    if (-not $owner -and -not ($groupId -and "$groupId" -ne "00000000-0000-0000-0000-000000000000")) { $flags.Add("No-Owner") }
+    if ($sharing -eq 'ExternalUserAndGuestSharing')                        { $flags.Add("Anyone-Links") }
+    if ($lockState -and $lockState -ne 'Unlock')                           { $flags.Add("Locked") }
+
+    $results.Add([PSCustomObject]@{
+        SiteUrl                 = $site.Url
+        Title                   = $site.Title
+        SiteType                = Get-SiteType -Site $site -Template $template -GroupId $groupId -IsTeams $isTeams
+        Template                = $template
+        Owner                   = $owner
+        OwnerName               = $ownerName
+        M365GroupId             = if ($groupId -and "$groupId" -ne "00000000-0000-0000-0000-000000000000") { "$groupId" } else { "" }
+        TeamsConnected          = $isTeams
+        HubStatus               = $hubText
+        StorageUsedGB           = [math]::Round($usedMB / 1024, 2)
+        StorageQuotaGB          = if ($quotaMB -gt 0) { [math]::Round($quotaMB / 1024, 2) } else { "" }
+        StoragePercentUsed      = $pctUsed
+        LastContentModified     = $lastModText
+        DaysSinceLastActivity   = $daysInactive
+        SharingCapability       = $sharing
+        LockState               = $lockState
+        SensitivityLabel        = "$(Get-SiteProp $site @('SensitivityLabel'))"
+        SubsiteCount            = Get-SiteProp $site @('WebsCount')
+        ArchiveStatus           = "$(Get-SiteProp $site @('ArchiveStatus'))"
+        FlagCount               = $flags.Count
+        Flags                   = ($flags -join "; ")
+    }) | Out-Null
+}
+
+$sorted = $results | Sort-Object @{ Expression = 'FlagCount'; Descending = $true }, @{ Expression = 'StorageUsedGB'; Descending = $true }
+
+# ---------------- Export ----------------
+$tempDir   = [System.IO.Path]::GetTempPath()
+$timestamp = Get-Date -Format "yyyy-MM-dd_HHmm"
+$csvPath   = Join-Path $tempDir "SharePointSiteInventory_$timestamp.csv"
+$sorted | Export-Csv -Path $csvPath -NoTypeInformation -Encoding utf8
+
+$attachment = $csvPath
+$csvSizeMB  = (Get-Item $csvPath).Length / 1MB
+if ($csvSizeMB -gt $ZipAttachmentOverMB) {
+    $zipPath = [System.IO.Path]::ChangeExtension($csvPath, ".zip")
+    Compress-Archive -Path $csvPath -DestinationPath $zipPath -Force
+    $attachment = $zipPath
+    Write-Output ("CSV is {0:N2} MB - attaching zipped copy ({1:N2} MB)." -f $csvSizeMB, ((Get-Item $zipPath).Length / 1MB))
+}
+
+# ---------------- Summary + email ----------------
+$totalUsedGB  = [math]::Round((($results | Measure-Object StorageUsedGB -Sum).Sum), 2)
+$flaggedCount = @($results | Where-Object { $_.FlagCount -gt 0 }).Count
+$flagNames    = @("Storage-Near-Quota", "Inactive", "No-Owner", "Anyone-Links", "Locked")
+$flagRows     = foreach ($f in $flagNames) {
+    $c = @($results | Where-Object { $_.Flags -like "*$f*" }).Count
+    "<tr><td>$f</td><td style='text-align:right'>$c</td></tr>"
+}
+$typeRows = $results | Group-Object SiteType | Sort-Object Count -Descending | ForEach-Object {
+    "<tr><td>$(ConvertTo-HtmlSafe $_.Name)</td><td style='text-align:right'>$($_.Count)</td></tr>"
+}
+$topRows = $results | Sort-Object StorageUsedGB -Descending | Select-Object -First $TopSitesInEmail | ForEach-Object {
+    "<tr><td>$(ConvertTo-HtmlSafe $_.Title)<br><span style='color:#666;font-size:11px'>$(ConvertTo-HtmlSafe $_.SiteUrl)</span></td>" +
+    "<td style='text-align:right'>$($_.StorageUsedGB)</td><td style='text-align:right'>$($_.StoragePercentUsed)</td>" +
+    "<td>$(ConvertTo-HtmlSafe $_.LastContentModified)</td><td>$(ConvertTo-HtmlSafe $_.Flags)</td></tr>"
+}
+
+$tbl = "border-collapse:collapse;font-family:Segoe UI,Arial,sans-serif;font-size:13px"
+$th  = "style='background:#f2f2f2;text-align:left;padding:4px 8px;border:1px solid #ddd'"
+$bodyHtml = @"
+<div style="font-family:Segoe UI,Arial,sans-serif;font-size:14px">
+<h2 style="margin-bottom:4px">SharePoint Site Inventory - $(ConvertTo-HtmlSafe $ClientName)</h2>
+<p style="color:#555;margin-top:0">Generated $((Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm")) UTC by Azure Automation (Runbook 13)</p>
+<p><b>Sites in report:</b> $($results.Count)<br>
+<b>Total storage used:</b> $totalUsedGB GB<br>
+<b>Sites with at least one flag:</b> $flaggedCount</p>
+
+<h3>Flags</h3>
+<table style="$tbl" border="1" cellpadding="4"><tr><th $th>Flag</th><th $th>Sites</th></tr>$($flagRows -join '')</table>
+<p style="font-size:12px;color:#666">Storage-Near-Quota &ge; $StorageWarnPercent% &middot; Inactive &ge; $InactiveDays days without content change &middot; Anyone-Links = site allows anonymous sharing</p>
+
+<h3>Sites by type</h3>
+<table style="$tbl" border="1" cellpadding="4"><tr><th $th>Type</th><th $th>Count</th></tr>$($typeRows -join '')</table>
+
+<h3>Top $TopSitesInEmail sites by storage</h3>
+<table style="$tbl" border="1" cellpadding="4">
+<tr><th $th>Site</th><th $th>Used (GB)</th><th $th>% of quota</th><th $th>Last modified</th><th $th>Flags</th></tr>
+$($topRows -join '')
+</table>
+<p style="font-size:12px;color:#666">Full inventory attached. Rows are sorted flagged-first, then by storage used.</p>
+</div>
+"@
+
+$subject    = "[$ClientName] SharePoint Site Inventory - $($results.Count) sites, $flaggedCount flagged - $(Get-Date -Format 'yyyy-MM-dd')"
+$graphToken = Get-ManagedIdentityToken -Resource "https://graph.microsoft.com/"
+
+Send-ReportEmail -SenderMailbox $SenderMailbox -Recipients $ReportRecipients -Subject $subject `
+    -BodyHtml $bodyHtml -AttachmentPath $attachment -AccessToken $graphToken
+
+Disconnect-PnPOnline
+Write-Output "Done. $($results.Count) sites reported, $flaggedCount flagged."

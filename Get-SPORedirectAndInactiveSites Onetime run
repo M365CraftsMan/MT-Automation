@@ -1,0 +1,116 @@
+#Requires -Version 7.4
+#Requires -Modules PnP.PowerShell
+<#
+.SYNOPSIS
+    One-time export of redirect sites and inactive SharePoint Online sites to CSV.
+
+.\Get-SPORedirectAndInactiveSites.ps1 -TenantName contoso -ClientId <app-id> -InactiveDays 180
+
+.DESCRIPTION
+    - Redirect sites  : Template = RedirectSite#0 (left behind after site URL changes / renames)
+    - Inactive sites  : LastContentModifiedDate older than -InactiveDays (default 180)
+    System sites (search center, MySite host, app catalog, etc.) are excluded from the
+    inactive check because they always look stale.
+
+.EXAMPLE
+    .\Get-SPORedirectAndInactiveSites.ps1 -TenantName contoso -ClientId 00000000-0000-0000-0000-000000000000
+
+.NOTES
+    Requires SharePoint Administrator (or Global Admin) and your own Entra ID app registration
+    for PnP (the shared PnP Management Shell app was retired in Sept 2024).
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)]
+    [string]$TenantName,                     # "contoso" from contoso.sharepoint.com
+
+    [Parameter(Mandatory)]
+    [string]$ClientId,                       # Entra app registration (client) ID
+
+    [int]$InactiveDays = 180,
+
+    [string]$OutputFolder = (Get-Location).Path,
+
+    [string[]]$ExcludeTemplates = @(
+        'SRCHCEN#0',            # Search Center
+        'SPSMSITEHOST#0',       # MySite host
+        'APPCATALOG#0',         # App Catalog
+        'POINTPUBLISHINGHUB#0',
+        'POINTPUBLISHINGTOPIC#0',
+        'EDISC#0',              # eDiscovery center
+        'RedirectSite#0'        # handled separately
+    )
+)
+
+$ErrorActionPreference = 'Stop'
+
+$adminUrl = "https://$TenantName-admin.sharepoint.com"
+$cutoff   = (Get-Date).AddDays(-$InactiveDays)
+$stamp    = Get-Date -Format 'yyyyMMdd-HHmm'
+$csvPath  = Join-Path $OutputFolder "SPO_Redirect_Inactive_Sites_$TenantName`_$stamp.csv"
+
+function ConvertTo-ReportRow {
+    param($Site, [string]$Category)
+
+    $lastMod = $Site.LastContentModifiedDate
+    [pscustomobject]@{
+        Category                = $Category
+        Url                     = $Site.Url
+        Title                   = $Site.Title
+        Template                = $Site.Template
+        Owner                   = $Site.Owner
+        IsGroupConnected        = ($Site.GroupId -and $Site.GroupId -ne [guid]::Empty)
+        LastContentModifiedDate = $lastMod
+        DaysSinceModified       = if ($lastMod) { [int]((Get-Date) - $lastMod).TotalDays } else { $null }
+        StorageUsedMB           = $Site.StorageUsageCurrent
+        LockState               = $Site.LockState
+        SharingCapability       = $Site.SharingCapability
+    }
+}
+
+try {
+    Write-Host "Connecting to $adminUrl ..." -ForegroundColor Cyan
+    Connect-PnPOnline -Url $adminUrl -ClientId $ClientId -Interactive
+
+    # --- Redirect sites (queried explicitly; the default listing doesn't reliably include them)
+    Write-Host 'Fetching redirect sites ...' -ForegroundColor Cyan
+    $redirectSites = @(Get-PnPTenantSite -Template 'RedirectSite#0')
+    Write-Host "  Found $($redirectSites.Count) redirect site(s)."
+
+    # --- All other sites, then filter for inactivity
+    Write-Host 'Fetching all sites (this can take a few minutes on large tenants) ...' -ForegroundColor Cyan
+    $allSites = @(Get-PnPTenantSite)
+    Write-Host "  Retrieved $($allSites.Count) site(s)."
+
+    $inactiveSites = @(
+        $allSites | Where-Object {
+            $_.Template -notin $ExcludeTemplates -and
+            $_.LastContentModifiedDate -and
+            $_.LastContentModifiedDate -lt $cutoff
+        }
+    )
+    Write-Host "  Found $($inactiveSites.Count) site(s) with no content changes in $InactiveDays+ days."
+
+    # --- Build report
+    $report = [System.Collections.Generic.List[object]]::new()
+    $redirectSites | ForEach-Object { $report.Add((ConvertTo-ReportRow -Site $_ -Category 'Redirect')) }
+    $inactiveSites | ForEach-Object { $report.Add((ConvertTo-ReportRow -Site $_ -Category "Inactive ($InactiveDays+ days)")) }
+
+    if ($report.Count -eq 0) {
+        Write-Host 'No redirect or inactive sites found. Nothing exported.' -ForegroundColor Yellow
+        return
+    }
+
+    $report |
+        Sort-Object Category, @{ Expression = 'DaysSinceModified'; Descending = $true } |
+        Export-Csv -Path $csvPath -NoTypeInformation -Encoding utf8
+
+    Write-Host "`nExported $($report.Count) row(s) to:`n  $csvPath" -ForegroundColor Green
+    $report | Group-Object Category | Select-Object Name, Count | Format-Table -AutoSize
+}
+catch {
+    Write-Error "Failed: $($_.Exception.Message)"
+}
+finally {
+    Disconnect-PnPOnline -ErrorAction SilentlyContinue
+}

@@ -1,0 +1,422 @@
+<#
+.SYNOPSIS
+    Runbook 20 - Teams external domain access audit (federation, guests, cross-tenant access).
+
+.DESCRIPTION
+    Read-only. Answers "which outside organisations and accounts can reach our users in Teams,
+    and how". Changes nothing.
+
+    Section A - Graph (always runs)
+      A1  Cross-tenant access DEFAULT: B2B collaboration (guests) and B2B direct connect
+          (Teams shared channels), inbound and outbound; inbound trust (MFA / device claims)
+      A2  Cross-tenant access PARTNER overrides - one row per partner tenant
+      A3  Guest invitation policy (who can invite guests; guest directory access level)
+      A4  Guest accounts grouped by email domain: count, pending invitations, stale (no sign-in
+          for $StaleGuestDays days), personal-mail domains flagged
+
+    Section B - Teams external access / federation (managed identity via token hand-off)
+      B1  Tenant federation: open vs allow list vs block list, Teams personal (consumer)
+          accounts inbound/outbound, trial tenants, Skype consumer
+      B2  External access policies (per-user overrides of B1)
+      B3  Teams guest access on/off
+      There is no Graph endpoint for any of this. The script gets two tokens for the MI
+      (Graph + "Skype and Teams Tenant Admin API") and passes them to
+      Connect-MicrosoftTeams -AccessTokens; the MI's Global Reader role authorises the reads.
+      If that fails for any reason, Section B is skipped with one note and Section A still reports.
+
+    NOT covered: who actually chatted externally (needs the audit log query API), meeting
+    anonymous-join settings (covered by the Teams meeting policy review).
+
+.NOTES
+    Auth        : Automation Account system-assigned Managed Identity, no secrets.
+    Permissions : Graph Policy.Read.All              (NEW - cross-tenant + authorization policy)
+                  Graph Directory.Read.All           (granted - guest users)
+                  Graph AuditLog.Read.All            (granted - guest last sign-in; needs Entra P1)
+                  Graph Mail.Send                    (granted)
+                  OPTIONAL Graph CrossTenantInformation.ReadBasic.All - partner tenant names
+                           instead of bare tenant IDs
+                  Entra role Global Reader on the MI (assigned) - Section B
+    Modules     : MicrosoftTeams (Section B only). App/token auth needs 4.7.1+; pin the version
+                  you import and test with - see UNVERIFIED.
+    Schedule    : monthly per the maintenance sheet.
+
+    UNVERIFIED - settle on the first test run:
+      1. Section B end to end: MI tokens accepted by Connect-MicrosoftTeams -AccessTokens, and
+         Global Reader honoured for Get-CsTenantFederationConfiguration / Get-CsExternalAccessPolicy
+         with an app token. The "Data gaps" box says exactly which step failed if it doesn't.
+      2. Which MicrosoftTeams module version runs on the Automation Account's runtime (7.2 vs the
+         7.4 runtime environment). Import the version you test with and set $TeamsModuleVersion.
+      3. Shape of AllowedDomains / BlockedDomains objects in that module version - the script
+         handles the old object form and the newer AllowedDomainsAsAList property.
+#>
+
+#region ---------------------------- CONFIG ----------------------------
+$TenantLabel          = 'CrucialLogics'
+$SenderMailbox        = 'm365-audits@cruciallogics.com'
+$Recipients           = @('replace-me@cruciallogics.com')
+
+$IncludeTeamsSection  = $true
+$TeamsModuleVersion   = ''        # e.g. '6.9.0' once tested; '' = whatever is imported
+
+$StaleGuestDays       = 90
+$PersonalMailDomains  = @('gmail.com','googlemail.com','outlook.com','hotmail.com','live.com','msn.com',
+                          'yahoo.com','ymail.com','icloud.com','me.com','aol.com','proton.me','protonmail.com',
+                          'gmx.com','gmx.net','mail.com','yandex.com','zoho.com')
+$ApprovedPartnerDomains = @()     # domains the client has signed off for federation / guests (wildcards)
+
+$TopGuestDomainsInEmail = 20
+$SendEmail            = $true
+#endregion -------------------------------------------------------------
+
+$ErrorActionPreference = 'Stop'
+
+#region ---------------------------- HELPERS ---------------------------
+function Get-MIToken {
+    param([string]$Resource)
+    if (-not $env:IDENTITY_ENDPOINT -or -not $env:IDENTITY_HEADER) {
+        throw 'IDENTITY_ENDPOINT / IDENTITY_HEADER not set. Run this in Azure Automation with the system-assigned managed identity enabled.'
+    }
+    $uri = "$($env:IDENTITY_ENDPOINT)?resource=$([uri]::EscapeDataString($Resource))&api-version=2019-08-01"
+    (Invoke-RestMethod -Method GET -Uri $uri -Headers @{ 'X-IDENTITY-HEADER' = $env:IDENTITY_HEADER; 'Metadata' = 'True' }).access_token
+}
+
+function Invoke-Graph {
+    param([string]$Uri)
+    Invoke-RestMethod -Method GET -Uri $Uri -Headers @{ Authorization = "Bearer $script:GraphToken"; ConsistencyLevel = 'eventual' }
+}
+function Get-GraphAll {
+    param([string]$Uri)
+    $out = New-Object System.Collections.Generic.List[object]
+    $next = $Uri
+    while ($next) {
+        $resp = Invoke-Graph $next
+        foreach ($v in @($resp.value)) { $out.Add($v) }
+        $next = $resp.'@odata.nextLink'
+    }
+    return $out.ToArray()
+}
+
+function Send-ReportEmail {
+    param(
+        [Parameter(Mandatory)] [string]   $From,
+        [Parameter(Mandatory)] [string[]] $To,
+        [Parameter(Mandatory)] [string]   $Subject,
+        [Parameter(Mandatory)] [string]   $HtmlBody,
+        [string] $AttachmentPath
+    )
+    $message = @{
+        subject      = $Subject
+        body         = @{ contentType = 'HTML'; content = $HtmlBody }
+        toRecipients = @($To | ForEach-Object { @{ emailAddress = @{ address = $_ } } })
+    }
+    if ($AttachmentPath -and (Test-Path -LiteralPath $AttachmentPath)) {
+        $bytes = [System.IO.File]::ReadAllBytes($AttachmentPath)
+        if ($bytes.Length -gt 3MB) { Write-Warning 'Attachment over 3 MB, sending without it.' }
+        else {
+            $message.attachments = @(@{
+                '@odata.type' = '#microsoft.graph.fileAttachment'
+                name          = [System.IO.Path]::GetFileName($AttachmentPath)
+                contentType   = 'text/csv'
+                contentBytes  = [System.Convert]::ToBase64String($bytes)
+            })
+        }
+    }
+    $payload = @{ message = $message; saveToSentItems = $false } | ConvertTo-Json -Depth 10
+    Invoke-RestMethod -Method POST -Uri "https://graph.microsoft.com/v1.0/users/$From/sendMail" `
+        -Headers @{ Authorization = "Bearer $(Get-MIToken 'https://graph.microsoft.com/')" } -Body $payload -ContentType 'application/json' | Out-Null
+}
+
+function Get-StatusRank { param([string]$s) switch ($s) { 'Fail' { 1 } 'Warn' { 2 } 'Info' { 3 } default { 9 } } }
+function Test-Like { param([string]$v, [string[]]$p) if (-not $v) { return $false }; foreach ($x in $p) { if ($v -like $x) { return $true } }; $false }
+function ConvertTo-HtmlSafe { param([string]$Text) [System.Net.WebUtility]::HtmlEncode($Text) }
+
+$rows = New-Object System.Collections.Generic.List[object]
+function Add-Row {
+    param([string]$Section, [string]$Item, [string]$Value, [string]$Status, [string]$Why, [string]$Recommendation = '')
+    $rows.Add([pscustomobject][ordered]@{
+        Priority = Get-StatusRank $Status; Status = $Status; Section = $Section; Item = $Item
+        Value = $Value; Finding = $Why; Recommendation = $Recommendation
+    })
+}
+
+# Cross-tenant access "usersAndGroups" block -> 'Allowed: all users' / 'Blocked: all users' / 'Allowed: 3 targets'
+function Format-Access {
+    param($Setting)
+    if (-not $Setting -or -not $Setting.usersAndGroups) { return 'inherits default' }
+    $ug = $Setting.usersAndGroups
+    $targets = @($ug.targets | ForEach-Object { "$($_.target)" })
+    $scope = if ($targets -contains 'AllUsers') { 'all users' } else { "$($targets.Count) specific user/group target(s)" }
+    return "$($ug.accessType): $scope"
+}
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- A. GRAPH --------------------------
+$nowUtc = [datetime]::UtcNow
+$gaps   = New-Object System.Collections.Generic.List[string]
+Write-Output "Runbook 20 - Teams external domain access audit. $($nowUtc.ToString('yyyy-MM-dd HH:mm')) UTC."
+$script:GraphToken = Get-MIToken 'https://graph.microsoft.com/'
+
+# ---- A1 cross-tenant default ----
+try {
+    $def = Invoke-Graph 'https://graph.microsoft.com/v1.0/policies/crossTenantAccessPolicy/default'
+    $pairs = @(
+        @{ K = 'b2bCollaborationInbound';  L = 'Guests IN (B2B collaboration inbound)' },
+        @{ K = 'b2bCollaborationOutbound'; L = 'Our users as guests elsewhere (B2B collaboration outbound)' },
+        @{ K = 'b2bDirectConnectInbound';  L = 'Shared channels IN (B2B direct connect inbound)' },
+        @{ K = 'b2bDirectConnectOutbound'; L = 'Shared channels OUT (B2B direct connect outbound)' }
+    )
+    foreach ($p in $pairs) {
+        $s = $def.($p.K)
+        $v = Format-Access $s
+        $status = 'Pass'; $why = 'Default for all external tenants.'; $rec = ''
+        if ($p.K -eq 'b2bDirectConnectInbound' -and $v -like 'allowed: all users*') {
+            $status = 'Warn'; $why = 'Any external organisation can bring users into shared channels by default.'
+            $rec = 'Block by default and allow direct connect per partner in partner settings.'
+        }
+        elseif ($p.K -eq 'b2bCollaborationInbound' -and $v -like 'allowed: all users*') {
+            $status = 'Info'; $why = 'Guests from any organisation can be invited (Microsoft default). Controlled further by the invitation policy (A3).'
+        }
+        Add-Row 'A1 Cross-tenant default' $p.L $v $status $why $rec
+    }
+    $trust = $def.inboundTrust
+    $mfa = if ($trust) { [bool]$trust.isMfaAccepted } else { $false }
+    Add-Row 'A1 Cross-tenant default' 'Trust external MFA' "$mfa" $(if ($mfa) { 'Pass' } else { 'Info' }) `
+        $(if ($mfa) { 'Guests who did MFA at home are not re-prompted.' } else { 'Guests must register MFA in this tenant too - fine, but friction; consider trusting MFA for known partners only.' })
+}
+catch {
+    $gaps.Add("Cross-tenant access policy unavailable (needs Policy.Read.All): $($_.Exception.Message)")
+}
+
+# ---- A2 partners ----
+try {
+    $partners = Get-GraphAll 'https://graph.microsoft.com/v1.0/policies/crossTenantAccessPolicy/partners'
+    $nameLookupOk = $true
+    foreach ($pt in $partners) {
+        $tid = "$($pt.tenantId)"
+        $name = $tid
+        if ($nameLookupOk) {
+            try {
+                $info = Invoke-Graph "https://graph.microsoft.com/v1.0/tenantRelationships/findTenantInformationByTenantId(tenantId='$tid')"
+                $name = "$($info.displayName) ($($info.defaultDomainName))"
+            }
+            catch {
+                $nameLookupOk = $false
+                $gaps.Add('Partner tenant names not resolved (optional CrossTenantInformation.ReadBasic.All not granted) - partners listed by tenant ID.')
+            }
+        }
+        $detail = "Guests IN: $(Format-Access $pt.b2bCollaborationInbound) | Shared channels IN: $(Format-Access $pt.b2bDirectConnectInbound) | Shared channels OUT: $(Format-Access $pt.b2bDirectConnectOutbound) | Trust MFA: $(if ($pt.inboundTrust) { $pt.inboundTrust.isMfaAccepted } else { 'inherits' })"
+        $status = if ($detail -match 'Shared channels IN: allowed') { 'Info' } else { 'Pass' }
+        Add-Row 'A2 Cross-tenant partner' $name $detail $status 'Partner-specific override of the defaults.'
+    }
+    if (-not $partners.Count) { Add-Row 'A2 Cross-tenant partner' '(none)' 'No partner overrides' 'Info' 'All external tenants get the default settings in A1.' }
+}
+catch { $gaps.Add("Cross-tenant partner settings unavailable: $($_.Exception.Message)") }
+
+# ---- A3 invitation policy ----
+try {
+    $auth = Invoke-Graph 'https://graph.microsoft.com/v1.0/policies/authorizationPolicy'
+    if ($auth.value) { $auth = @($auth.value)[0] }
+    $inv = "$($auth.allowInvitesFrom)"
+    switch ($inv) {
+        'everyone'                            { Add-Row 'A3 Guest invitations' 'Who can invite guests' $inv 'Fail' 'Anyone, including existing guests, can invite more guests.' 'Restrict to adminsAndGuestInviters or adminsGuestInvitersAndAllMembers.' }
+        'adminsGuestInvitersAndAllMembers'    { Add-Row 'A3 Guest invitations' 'Who can invite guests' $inv 'Info' 'All members can invite guests (Microsoft default).' 'Consider limiting to the Guest Inviter role if guest sprawl is a problem (see A4).' }
+        default                               { Add-Row 'A3 Guest invitations' 'Who can invite guests' $inv 'Pass' 'Invitations restricted.' }
+    }
+    $roleMap = @{ 'a0b1b346-4d3e-4e8b-98f8-753987be4970' = 'Same as members'; '10dae51f-b6af-4016-8d66-8c2a99b929b3' = 'Limited (default)'; '2af84b1e-32c8-42b7-82bc-daa82404023b' = 'Most restricted' }
+    $gr = "$($auth.guestUserRoleId)"
+    $grName = if ($roleMap.ContainsKey($gr)) { $roleMap[$gr] } else { $gr }
+    Add-Row 'A3 Guest invitations' 'Guest directory access' $grName $(if ($grName -eq 'Same as members') { 'Fail' } else { 'Pass' }) `
+        $(if ($grName -eq 'Same as members') { 'Guests can enumerate the whole directory like employees.' } else { 'Guest directory visibility restricted.' })
+}
+catch { $gaps.Add("Authorization policy unavailable (needs Policy.Read.All): $($_.Exception.Message)") }
+
+# ---- A4 guests by domain ----
+$guestDomains = @()
+try {
+    $sel = 'id,displayName,mail,userPrincipalName,createdDateTime,accountEnabled,externalUserState'
+    try { $guests = Get-GraphAll "https://graph.microsoft.com/v1.0/users?`$filter=userType eq 'Guest'&`$select=$sel,signInActivity&`$top=500"; $signIn = $true }
+    catch {
+        $guests = Get-GraphAll "https://graph.microsoft.com/v1.0/users?`$filter=userType eq 'Guest'&`$select=$sel&`$top=999"; $signIn = $false
+        $gaps.Add('Guest last sign-in unavailable (needs AuditLog.Read.All + Entra P1) - stale-guest counts omitted.')
+    }
+    $staleCut = $nowUtc.AddDays(-$StaleGuestDays)
+    $guestDomains = @($guests | ForEach-Object {
+        $addr = if ($_.mail) { "$($_.mail)" } else { ("$($_.userPrincipalName)" -replace '#EXT#.*$', '' -replace '_(?=[^_]+$)', '@') }
+        $dom = ($addr -split '@')[-1].ToLowerInvariant()
+        $last = $null
+        if ($signIn -and $_.signInActivity) {
+            $cands = @($_.signInActivity.lastSignInDateTime, $_.signInActivity.lastNonInteractiveSignInDateTime) | Where-Object { $_ } | ForEach-Object { [datetime]$_ }
+            if ($cands) { $last = ($cands | Sort-Object -Descending | Select-Object -First 1).ToUniversalTime() }
+        }
+        [pscustomobject]@{ Domain = $dom; Pending = ("$($_.externalUserState)" -eq 'PendingAcceptance'); Stale = ($signIn -and ((-not $last) -or $last -lt $staleCut)); Disabled = ($_.accountEnabled -eq $false) }
+    } | Group-Object Domain | ForEach-Object {
+        [pscustomobject]@{
+            Domain   = $_.Name
+            Guests   = $_.Count
+            Pending  = @($_.Group | Where-Object Pending).Count
+            Stale    = @($_.Group | Where-Object Stale).Count
+            Disabled = @($_.Group | Where-Object Disabled).Count
+            Personal = ($PersonalMailDomains -contains $_.Name)
+            Approved = (Test-Like $_.Name $ApprovedPartnerDomains)
+        }
+    } | Sort-Object Guests -Descending)
+
+    foreach ($d in $guestDomains) {
+        $status = 'Pass'; $why = New-Object System.Collections.Generic.List[string]
+        if ($d.Personal) { $status = 'Warn'; $why.Add('personal mail domain - no organisation behind these identities') }
+        if ($signIn -and $d.Stale -eq $d.Guests -and $d.Guests -gt 0) { if ($status -eq 'Pass') { $status = 'Info' }; $why.Add("no guest from this domain signed in for $StaleGuestDays+ days") }
+        elseif ($d.Stale -gt 0) { $why.Add("$($d.Stale) stale") }
+        if ($d.Pending -gt 0) { $why.Add("$($d.Pending) never accepted") }
+        if ($ApprovedPartnerDomains.Count -and -not $d.Approved -and $status -eq 'Pass') { $status = 'Info'; $why.Add('not on approved partner list') }
+        Add-Row 'A4 Guests by domain' $d.Domain "$($d.Guests) guest(s)" $status $(if ($why.Count) { $why -join '; ' } else { 'Active guests.' }) `
+            $(if ($d.Stale) { 'Run an access review or remove stale guests.' } else { '' })
+    }
+    Write-Output "Guests: $(@($guests).Count) across $($guestDomains.Count) domains."
+}
+catch { $gaps.Add("Guest users unavailable: $($_.Exception.Message)") }
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- B. TEAMS (MI TOKEN) ---------------
+$teamsOk = $false
+if ($IncludeTeamsSection) {
+    $step = 'import MicrosoftTeams module'
+    try {
+        if ($TeamsModuleVersion) { Import-Module MicrosoftTeams -RequiredVersion $TeamsModuleVersion -ErrorAction Stop }
+        else { Import-Module MicrosoftTeams -ErrorAction Stop }
+        $step = 'get MI tokens'
+        $teamsToken = Get-MIToken '48ac35b8-9aa8-4d74-927d-1f4a14a0b239'   # Skype and Teams Tenant Admin API
+        $step = 'Connect-MicrosoftTeams -AccessTokens'
+        Connect-MicrosoftTeams -AccessTokens @($script:GraphToken, $teamsToken) -ErrorAction Stop | Out-Null
+        $step = 'Get-CsTenantFederationConfiguration'
+        $fed = Get-CsTenantFederationConfiguration -ErrorAction Stop
+        $teamsOk = $true
+
+        # ---- B1 federation ----
+        $allowFed = "$($fed.AllowFederatedUsers)" -eq 'True'
+        $allowedObj = $fed.AllowedDomains
+        $allowList = @()
+        if ($fed.PSObject.Properties['AllowedDomainsAsAList'] -and $fed.AllowedDomainsAsAList) { $allowList = @($fed.AllowedDomainsAsAList | ForEach-Object { "$_" }) }
+        elseif ($allowedObj -and $allowedObj.PSObject.Properties['AllowedDomain']) { $allowList = @($allowedObj.AllowedDomain | ForEach-Object { if ($_.Domain) { "$($_.Domain)" } else { "$_" } }) }
+        $openAll = $allowFed -and ($allowList.Count -eq 0) -and ((-not $allowedObj) -or ("$allowedObj" -match 'AllowAllKnownDomains') -or ($allowedObj.GetType().Name -match 'AllowAllKnownDomains'))
+        $blocked = @($fed.BlockedDomains | ForEach-Object { if ($_.Domain) { "$($_.Domain)" } else { "$_" } } | Where-Object { $_ })
+
+        if (-not $allowFed) {
+            Add-Row 'B1 Teams federation' 'External access (federation)' 'Off' 'Pass' 'Users cannot chat or call with other Teams organisations.'
+        }
+        elseif ($openAll) {
+            Add-Row 'B1 Teams federation' 'External access (federation)' "Open to all domains; $($blocked.Count) blocked" 'Warn' `
+                'Any external Teams organisation can chat with and call your users - the path used by Teams-based phishing campaigns.' `
+                'Switch to an allow list of partner domains, or at minimum block known-bad domains and trial tenants.'
+        }
+        else {
+            Add-Row 'B1 Teams federation' 'External access (federation)' "Allow list: $($allowList -join ', ')" 'Pass' 'Federation limited to listed domains.'
+            $unapproved = @($allowList | Where-Object { $ApprovedPartnerDomains.Count -and -not (Test-Like $_ $ApprovedPartnerDomains) })
+            if ($unapproved.Count) { Add-Row 'B1 Teams federation' 'Allow-list domains not on approved list' ($unapproved -join ', ') 'Info' 'Allowed for federation but not in $ApprovedPartnerDomains - confirm still needed.' }
+        }
+        if ($blocked.Count) { Add-Row 'B1 Teams federation' 'Blocked domains' ($blocked -join ', ') 'Info' 'Explicitly blocked for federation.' }
+
+        $consumer = "$($fed.AllowTeamsConsumer)" -eq 'True'
+        $consumerIn = "$($fed.AllowTeamsConsumerInbound)" -eq 'True'
+        if ($consumer -and $consumerIn) {
+            Add-Row 'B1 Teams federation' 'Teams personal accounts' 'Allowed, can START chats with our users' 'Fail' `
+                'Unmanaged personal Teams accounts can message anyone - a known malware/phishing delivery route.' `
+                'Turn off inbound (AllowTeamsConsumerInbound = False) or disable consumer access entirely.'
+        }
+        elseif ($consumer) { Add-Row 'B1 Teams federation' 'Teams personal accounts' 'Allowed, outbound only (our users start)' 'Info' 'Our users can reach personal accounts; they cannot initiate.' }
+        else { Add-Row 'B1 Teams federation' 'Teams personal accounts' 'Off' 'Pass' 'Personal Teams accounts cannot communicate with our users.' }
+
+        if ($fed.PSObject.Properties['ExternalAccessWithTrialTenants']) {
+            $trial = "$($fed.ExternalAccessWithTrialTenants)"
+            Add-Row 'B1 Teams federation' 'Trial tenants' $trial $(if ($trial -eq 'Allowed' -and $allowFed) { 'Warn' } else { 'Pass' }) `
+                $(if ($trial -eq 'Allowed' -and $allowFed) { 'Free trial tenants (throwaway, often attacker-created) can federate with us.' } else { 'Trial tenants blocked.' }) `
+                $(if ($trial -eq 'Allowed' -and $allowFed) { 'Set ExternalAccessWithTrialTenants to Blocked.' } else { '' })
+        }
+        if ("$($fed.AllowPublicUsers)" -eq 'True') { Add-Row 'B1 Teams federation' 'Skype (consumer) users' 'Allowed' 'Info' 'Legacy Skype consumer interop enabled.' }
+
+        # ---- B2 external access policies ----
+        $step = 'Get-CsExternalAccessPolicy'
+        foreach ($pol in @(Get-CsExternalAccessPolicy -ErrorAction Stop)) {
+            $id = "$($pol.Identity)"
+            $v = "Federation=$($pol.EnableFederationAccess); TeamsConsumer=$($pol.EnableTeamsConsumerAccess); ConsumerInbound=$($pol.EnableTeamsConsumerInbound); Skype=$($pol.EnablePublicCloudAccess)"
+            $st = if ($id -ne 'Global' -and ("$($pol.EnableTeamsConsumerInbound)" -eq 'True' -and $consumer)) { 'Warn' } else { 'Info' }
+            Add-Row 'B2 External access policy' $id $v $st $(if ($id -eq 'Global') { 'Applies to everyone without a custom policy. Tenant settings in B1 still cap it.' } else { 'Custom policy - check who it is assigned to.' })
+        }
+
+        # ---- B3 guest access ----
+        $step = 'Get-CsTeamsClientConfiguration'
+        $cc = Get-CsTeamsClientConfiguration -ErrorAction Stop
+        $g = "$($cc.AllowGuestUser)"
+        Add-Row 'B3 Teams guest access' 'Guest access in Teams' $g 'Info' `
+            $(if ($g -eq 'True') { 'Guests (A4) can be added to teams. Membership reviewed via group access reviews.' } else { 'Guests cannot be added to teams.' })
+
+        Disconnect-MicrosoftTeams -ErrorAction SilentlyContinue | Out-Null
+    }
+    catch {
+        $msg = "Teams section skipped - failed at step '$step': $($_.Exception.Message)."
+        if (-not $teamsOk) { $msg += ' Federation, personal-account and trial-tenant settings were NOT checked; Graph sections are complete.' }
+        $gaps.Add($msg)
+        Write-Warning $msg
+    }
+}
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- OUTPUT ----------------------------
+$final = @($rows | Sort-Object Priority, Section, Item)
+$stamp = $nowUtc.ToString('yyyyMMdd-HHmm')
+$csvPath = Join-Path ([System.IO.Path]::GetTempPath()) "TeamsExternalAccess-$stamp.csv"
+if ($final.Count) { $final | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding utf8 }
+
+$fails = @($final | Where-Object Status -eq 'Fail').Count
+$warns = @($final | Where-Object Status -eq 'Warn').Count
+$th  = 'style="background:#f0f0f0;text-align:left;padding:5px;border:1px solid #ccc"'
+$td  = 'style="padding:5px;border:1px solid #ccc"'
+$tdr = 'style="padding:5px;border:1px solid #ccc;text-align:right"'
+$sc  = @{ Fail = 'color:#b00020;font-weight:600'; Warn = 'color:#b36b00;font-weight:600'; Info = 'color:#555'; Pass = 'color:#1b7f3b' }
+
+$sb = New-Object System.Text.StringBuilder
+[void]$sb.Append('<html><body style="font-family:Segoe UI,Arial,sans-serif;font-size:13px;color:#222">')
+[void]$sb.Append("<h2 style='margin-bottom:4px'>Teams external access audit - $(ConvertTo-HtmlSafe $TenantLabel)</h2>")
+[void]$sb.Append("<p style='margin-top:0;color:#555'>Who outside the organisation can reach users in Teams, and how. $fails fail, $warns warn. Read-only. Full detail in the attached CSV.</p>")
+if ($gaps.Count) {
+    [void]$sb.Append('<div style="background:#fff4e5;border-left:4px solid #e08a00;padding:8px 12px;margin:10px 0"><b>Data gaps:</b><ul style="margin:4px 0">')
+    foreach ($g in $gaps) { [void]$sb.Append("<li>$(ConvertTo-HtmlSafe $g)</li>") }
+    [void]$sb.Append('</ul></div>')
+}
+
+$settingRows = @($final | Where-Object { $_.Section -notlike 'A4*' })
+[void]$sb.Append("<h3>Settings</h3><table style='border-collapse:collapse'><tr><th $th>Status</th><th $th>Area</th><th $th>Setting</th><th $th>Value</th><th $th>Why / recommendation</th></tr>")
+foreach ($r in ($settingRows | Sort-Object Priority, Section)) {
+    $why = if ($r.Recommendation) { "$(ConvertTo-HtmlSafe $r.Finding) <b>$(ConvertTo-HtmlSafe $r.Recommendation)</b>" } else { ConvertTo-HtmlSafe $r.Finding }
+    [void]$sb.Append("<tr><td style='padding:5px;border:1px solid #ccc;$($sc[$r.Status])'>$($r.Status)</td><td $td>$(ConvertTo-HtmlSafe $r.Section)</td><td $td>$(ConvertTo-HtmlSafe $r.Item)</td><td $td>$(ConvertTo-HtmlSafe $r.Value)</td><td $td>$why</td></tr>")
+}
+[void]$sb.Append('</table>')
+
+if ($guestDomains.Count) {
+    $tot = ($guestDomains | Measure-Object Guests -Sum).Sum
+    $stale = ($guestDomains | Measure-Object Stale -Sum).Sum
+    $pend = ($guestDomains | Measure-Object Pending -Sum).Sum
+    [void]$sb.Append("<h3>Guests by domain ($tot guests, $($guestDomains.Count) domains, $stale stale, $pend never accepted)</h3><table style='border-collapse:collapse'><tr><th $th>Domain</th><th $th>Guests</th><th $th>Stale</th><th $th>Never accepted</th><th $th>Note</th></tr>")
+    foreach ($d in ($guestDomains | Select-Object -First $TopGuestDomainsInEmail)) {
+        $note = if ($d.Personal) { "<span style='$($sc.Warn)'>Personal mail</span>" } else { '' }
+        [void]$sb.Append("<tr><td $td>$(ConvertTo-HtmlSafe $d.Domain)</td><td $tdr>$($d.Guests)</td><td $tdr>$($d.Stale)</td><td $tdr>$($d.Pending)</td><td $td>$note</td></tr>")
+    }
+    [void]$sb.Append('</table>')
+}
+[void]$sb.Append("<p style='color:#888;font-size:11px'>Generated by Runbook 20 (20-Audit-TeamsExternalAccess.ps1), Azure Automation, managed identity. Federation = chat/calls with other Teams orgs (users stay in their tenant). Guests = accounts in this tenant. Shared channels = B2B direct connect.</p></body></html>")
+$html = $sb.ToString()
+
+Write-Output "Rows: $($final.Count). Fail: $fails, Warn: $warns. Teams section: $(if ($teamsOk) { 'ran' } else { 'skipped' })."
+foreach ($g in $gaps) { Write-Output "  DATA GAP: $g" }
+
+if ($SendEmail) {
+    $flag = if ($fails) { "[$fails fail] " } elseif ($warns) { "[$warns warn] " } else { '' }
+    try {
+        Send-ReportEmail -From $SenderMailbox -To $Recipients -Subject "${flag}Teams external access audit - $TenantLabel - $($nowUtc.ToString('yyyy-MM-dd'))" `
+            -HtmlBody $html -AttachmentPath $(if ($final.Count) { $csvPath } else { $null })
+        Write-Output "Report emailed to $($Recipients -join ', ')."
+    }
+    catch { Write-Error "sendMail failed from $SenderMailbox. $($_.Exception.Message)"; throw }
+    Remove-Item -LiteralPath $csvPath -Force -ErrorAction SilentlyContinue
+}
+else { Write-Output "SendEmail is off. CSV written to $csvPath." }
+#endregion -------------------------------------------------------------

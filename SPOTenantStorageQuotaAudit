@@ -1,0 +1,416 @@
+<#
+.SYNOPSIS
+    Runbook 19 - SharePoint Online + OneDrive storage consumption, per site and tenant-wide,
+    compared with the SharePoint tenant storage quota.
+
+.DESCRIPTION
+    Read-only.
+
+    Per site (SharePoint) and per account (OneDrive), from Graph usage reports:
+      storage used, storage allocated (site quota), % of site quota, file count, last activity.
+    Tenant-wide:
+      SharePoint total used  vs  tenant SharePoint quota  -> % used, free space,
+      30-day growth and a straight-line forecast of when the quota runs out.
+      OneDrive total used, reported separately.
+
+    WHY ONEDRIVE IS NOT COMPARED WITH THE QUOTA
+      The tenant SharePoint storage quota (1 TB + 10 GB per eligible licence + add-on storage) is
+      consumed by SharePoint sites (including Teams / group sites) only. OneDrive has its own
+      per-user allocation and does not draw from it. Adding OneDrive to the comparison would make
+      the tenant look far fuller than it is.
+
+    TENANT QUOTA SOURCE (in order)
+      1. Authoritative: SharePoint admin API Tenant.StorageQuota via PnP (needs the SharePoint API
+         permission Sites.FullControl.All - same CR decision as Runbook 16). Tried only if
+         $TryAdminApiForQuota is on; any failure falls through to 2.
+      2. Estimate: 1 TB + 10 GB x purchased units of licences that include a SharePoint Online
+         Plan 1/2 service plan + 1 GB x units of "Office 365 Extra File Storage".
+         Close but not exact (trial, EDU and some add-on edge cases) - labelled ESTIMATE in the
+         report. Check it once against SharePoint admin center > Settings... storage.
+
+    Flags
+      Tenant : SharePoint used >= $TenantWarnPct / $TenantCritPct of quota; forecast full within
+               $ForecastWarnDays days.
+      Site   : >= $SiteQuotaWarnPct of its own site quota; large (>= $ArchiveCandidateGB) and no
+               activity for $InactiveDays+ days = archive candidate (Microsoft 365 Archive).
+      OneDrive: >= $SiteQuotaWarnPct of its allocation.
+
+.NOTES
+    Auth        : Automation Account system-assigned Managed Identity. Graph via MI token from
+                  IDENTITY_ENDPOINT + REST (no Microsoft.Graph module, so PnP can load alongside
+                  without the MSAL assembly clash).
+    Permissions : Graph Reports.Read.All       (PENDING - same grant Runbook 14 is waiting on)
+                  Graph Sites.Read.All         (granted) - resolves site URLs if reports are concealed
+                  Graph Directory.Read.All     (granted) - subscribedSkus for the quota estimate
+                  Graph Mail.Send              (granted)
+                  OPTIONAL SharePoint Sites.FullControl.All - authoritative quota (Runbook 16 decision)
+    Modules     : none required. PnP.PowerShell 2.12.0 only if $TryAdminApiForQuota is on and imported.
+    Schedule    : monthly recommended (trend + forecast are the useful part).
+    Data lag    : Microsoft usage reports run ~2 days behind. Figures are "as of" the report
+                  refresh date shown in the email, not the run time.
+#>
+
+#region ---------------------------- CONFIG ----------------------------
+$TenantLabel          = 'CrucialLogics'
+$SenderMailbox        = 'm365-audits@cruciallogics.com'
+$Recipients           = @('replace-me@cruciallogics.com')
+
+$TryAdminApiForQuota  = $true
+$TenantAdminUrl       = 'https://contoso-admin.sharepoint.com'
+
+$TenantWarnPct        = 80
+$TenantCritPct        = 90
+$ForecastWarnDays     = 180
+$SiteQuotaWarnPct     = 90
+$ArchiveCandidateGB   = 10
+$InactiveDays         = 180
+
+$TopSitesInEmail      = 15
+$TopOneDrivesInEmail  = 10
+$SendEmail            = $true
+#endregion -------------------------------------------------------------
+
+$ErrorActionPreference = 'Stop'
+
+#region ---------------------------- HELPERS ---------------------------
+function Get-MIToken {
+    param([string]$Resource = 'https://graph.microsoft.com/')
+    if (-not $env:IDENTITY_ENDPOINT -or -not $env:IDENTITY_HEADER) {
+        throw 'IDENTITY_ENDPOINT / IDENTITY_HEADER not set. Run this in Azure Automation with the system-assigned managed identity enabled.'
+    }
+    $uri = "$($env:IDENTITY_ENDPOINT)?resource=$Resource&api-version=2019-08-01"
+    (Invoke-RestMethod -Method GET -Uri $uri -Headers @{ 'X-IDENTITY-HEADER' = $env:IDENTITY_HEADER; 'Metadata' = 'True' }).access_token
+}
+
+function Get-GraphAll {
+    param([string]$Uri)
+    $out = New-Object System.Collections.Generic.List[object]
+    $next = $Uri
+    while ($next) {
+        $resp = Invoke-RestMethod -Method GET -Uri $next -Headers @{ Authorization = "Bearer $script:GraphToken" }
+        foreach ($v in @($resp.value)) { $out.Add($v) }
+        $next = $resp.'@odata.nextLink'
+    }
+    return $out.ToArray()
+}
+
+# Usage reports answer with a redirect to a CSV file; download it and parse (Import-Csv handles the BOM)
+function Get-ReportCsv {
+    param([string]$Function)
+    $path = Join-Path ([System.IO.Path]::GetTempPath()) ("rpt-{0}.csv" -f [guid]::NewGuid())
+    try {
+        Invoke-WebRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/reports/$Function" `
+            -Headers @{ Authorization = "Bearer $script:GraphToken" } -OutFile $path -UseBasicParsing | Out-Null
+        return ,@(Import-Csv -LiteralPath $path)
+    }
+    finally { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue } }
+}
+
+function Send-ReportEmail {
+    param(
+        [Parameter(Mandatory)] [string]   $From,
+        [Parameter(Mandatory)] [string[]] $To,
+        [Parameter(Mandatory)] [string]   $Subject,
+        [Parameter(Mandatory)] [string]   $HtmlBody,
+        [string] $AttachmentPath
+    )
+    $message = @{
+        subject      = $Subject
+        body         = @{ contentType = 'HTML'; content = $HtmlBody }
+        toRecipients = @($To | ForEach-Object { @{ emailAddress = @{ address = $_ } } })
+    }
+    if ($AttachmentPath -and (Test-Path -LiteralPath $AttachmentPath)) {
+        $path = $AttachmentPath
+        if ((Get-Item -LiteralPath $path).Length -gt 2.5MB) {
+            $zip = [System.IO.Path]::ChangeExtension($path, '.zip')
+            Compress-Archive -LiteralPath $path -DestinationPath $zip -Force
+            $path = $zip
+        }
+        $bytes = [System.IO.File]::ReadAllBytes($path)
+        if ($bytes.Length -gt 3MB) {
+            Write-Warning "Attachment is $([math]::Round($bytes.Length / 1MB, 2)) MB even zipped. Sending without it."
+        }
+        else {
+            $message.attachments = @(@{
+                '@odata.type' = '#microsoft.graph.fileAttachment'
+                name          = [System.IO.Path]::GetFileName($path)
+                contentType   = $(if ($path -like '*.zip') { 'application/zip' } else { 'text/csv' })
+                contentBytes  = [System.Convert]::ToBase64String($bytes)
+            })
+        }
+    }
+    $payload = @{ message = $message; saveToSentItems = $false } | ConvertTo-Json -Depth 10
+    Invoke-RestMethod -Method POST -Uri "https://graph.microsoft.com/v1.0/users/$From/sendMail" `
+        -Headers @{ Authorization = "Bearer $(Get-MIToken)" } -Body $payload -ContentType 'application/json' | Out-Null
+}
+
+function Get-Col { param($Row, [string]$Name) $p = $Row.PSObject.Properties[$Name]; if ($p) { "$($p.Value)" } else { '' } }
+function ConvertTo-Long { param([string]$s) $v = [long]0; [void][long]::TryParse($s, [ref]$v); $v }
+function ConvertTo-Date {
+    param([string]$s)
+    $d = [datetime]::MinValue
+    if ($s -and [datetime]::TryParse($s, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$d)) { return $d.ToUniversalTime() }
+    return $null
+}
+function Format-Bytes {
+    param([double]$B)
+    if ($B -ge 1TB) { return '{0:N2} TB' -f ($B / 1TB) }
+    if ($B -ge 1GB) { return '{0:N2} GB' -f ($B / 1GB) }
+    if ($B -ge 1MB) { return '{0:N1} MB' -f ($B / 1MB) }
+    return '{0:N0} KB' -f ($B / 1KB)
+}
+function Get-Pct { param([double]$Used, [double]$Total) if ($Total -gt 0) { [math]::Round(100 * $Used / $Total, 1) } else { $null } }
+function ConvertTo-HtmlSafe { param([string]$Text) [System.Net.WebUtility]::HtmlEncode($Text) }
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- COLLECT ---------------------------
+$nowUtc = [datetime]::UtcNow
+$gaps   = New-Object System.Collections.Generic.List[string]
+Write-Output "Runbook 19 - Storage consumption review. $($nowUtc.ToString('yyyy-MM-dd HH:mm')) UTC."
+
+$script:GraphToken = Get-MIToken
+
+# ---- Per-site / per-account usage (Reports.Read.All) ----
+try {
+    $spoRpt = Get-ReportCsv "getSharePointSiteUsageDetail(period='D7')"
+    $odbRpt = Get-ReportCsv "getOneDriveUsageAccountDetail(period='D7')"
+}
+catch {
+    Write-Error ("Usage reports failed. A 403 / S2SUnauthorized means Reports.Read.All is not granted to the MI yet " +
+        "(or hasn't propagated). $($_.Exception.Message)")
+    throw
+}
+Write-Output "Report rows: SharePoint $($spoRpt.Count), OneDrive $($odbRpt.Count)."
+
+# ---- Trend (30 days) ----
+$spoTrend = @(); $odbTrend = @()
+try { $spoTrend = Get-ReportCsv "getSharePointSiteUsageStorage(period='D30')" } catch { $gaps.Add("SharePoint 30-day storage trend unavailable: $($_.Exception.Message)") }
+try { $odbTrend = Get-ReportCsv "getOneDriveUsageStorage(period='D30')" }       catch { $gaps.Add("OneDrive 30-day storage trend unavailable: $($_.Exception.Message)") }
+
+# ---- Site URL resolution (reports may be concealed) ----
+$siteById = @{}
+$concealed = (@($spoRpt | Where-Object { (Get-Col $_ 'Site URL') -like 'https://*' }).Count -eq 0) -and $spoRpt.Count -gt 0
+if ($concealed) {
+    try {
+        foreach ($s in (Get-GraphAll 'https://graph.microsoft.com/v1.0/sites/getAllSites?$select=id,displayName,webUrl')) {
+            $parts = "$($s.id)" -split ','
+            if ($parts.Count -ge 2) { $siteById[$parts[1].ToLowerInvariant()] = $s }
+        }
+        $gaps.Add("Usage reports are concealed. Site URLs were recovered via Sites.Read.All ($($siteById.Count) sites matched by ID); OneDrive owners stay hidden unless their URL was matched. To show names, untick 'Display concealed user, group, and site names' in M365 admin center > Settings > Org settings > Reports.")
+    }
+    catch { $gaps.Add("Usage reports are concealed and site URL lookup failed: $($_.Exception.Message). Sites are listed by ID only.") }
+}
+
+# ---- Tenant quota ----
+$quotaBytes = $null; $quotaSource = ''
+if ($TryAdminApiForQuota) {
+    try {
+        Import-Module PnP.PowerShell -RequiredVersion 2.12.0 -ErrorAction Stop
+        Connect-PnPOnline -Url $TenantAdminUrl -ManagedIdentity -ErrorAction Stop
+        $t = Get-PnPTenant
+        $qMb = ConvertTo-Long "$($t.StorageQuota)"
+        if ($qMb -gt 0) { $quotaBytes = [double]$qMb * 1MB; $quotaSource = 'SharePoint admin API (authoritative)' }
+        Disconnect-PnPOnline -ErrorAction SilentlyContinue
+    }
+    catch {
+        $gaps.Add("Authoritative quota not available via the SharePoint admin API (needs PnP.PowerShell 2.12.0 and SharePoint Sites.FullControl.All): $($_.Exception.Message). Using the licence-based estimate.")
+    }
+}
+$licenceBreakdown = New-Object System.Collections.Generic.List[string]
+if (-not $quotaBytes) {
+    try {
+        $skus = Get-GraphAll 'https://graph.microsoft.com/v1.0/subscribedSkus'
+        $eligibleUnits = 0; $extraGB = 0
+        foreach ($k in $skus) {
+            $units = [int]$k.prepaidUnits.enabled
+            if ($k.skuPartNumber -eq 'SHAREPOINTSTORAGE') { $extraGB += $units; $licenceBreakdown.Add("$($k.skuPartNumber): +$units GB add-on"); continue }
+            $plans = @($k.servicePlans | ForEach-Object { "$($_.servicePlanName)" })
+            $hasSpo = @($plans | Where-Object { $_ -match '^SHAREPOINT(ENTERPRISE|STANDARD)' }).Count -gt 0
+            if ($hasSpo -and $units -gt 0 -and $units -lt 10000) {
+                $eligibleUnits += $units
+                $licenceBreakdown.Add("$($k.skuPartNumber): $units x 10 GB")
+            }
+        }
+        $quotaBytes  = 1TB + ([double]$eligibleUnits * 10GB) + ([double]$extraGB * 1GB)
+        $quotaSource = "ESTIMATE from licences: 1 TB + $eligibleUnits eligible licences x 10 GB + $extraGB GB add-on"
+    }
+    catch { $gaps.Add("Could not read licences for the quota estimate: $($_.Exception.Message). Quota comparison skipped.") }
+}
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- ANALYSE ---------------------------
+$inactiveCut = $nowUtc.AddDays(-$InactiveDays)
+$rows = New-Object System.Collections.Generic.List[object]
+$meta = @{ RefreshDate = '' }
+
+function Add-SiteRow {
+    param([string]$Workload, $R)
+    if ((Get-Col $R 'Is Deleted') -eq 'True') { return }
+    $rd = Get-Col $R 'Report Refresh Date'; if ($rd) { $meta.RefreshDate = $rd }
+    $used  = [double](ConvertTo-Long (Get-Col $R 'Storage Used (Byte)'))
+    $alloc = [double](ConvertTo-Long (Get-Col $R 'Storage Allocated (Byte)'))
+    $url   = Get-Col $R 'Site URL'
+    $title = ''
+    $sid   = (Get-Col $R 'Site Id').ToLowerInvariant()
+    if (($url -notlike 'https://*') -and $siteById.ContainsKey($sid)) { $url = $siteById[$sid].webUrl; $title = $siteById[$sid].displayName }
+    elseif ($siteById.ContainsKey($sid)) { $title = $siteById[$sid].displayName }
+    $last  = ConvertTo-Date (Get-Col $R 'Last Activity Date')
+    $pct   = Get-Pct $used $alloc
+
+    $flags = New-Object System.Collections.Generic.List[string]
+    if ($pct -ne $null -and $pct -ge $SiteQuotaWarnPct) { $flags.Add("Near quota ($pct%)") }
+    if ($used -ge ([double]$ArchiveCandidateGB * 1GB) -and ((-not $last) -or $last -lt $inactiveCut)) {
+        $flags.Add($(if ($Workload -eq 'SharePoint') { "Archive candidate (no activity $InactiveDays+ days)" } else { "Large and inactive $InactiveDays+ days" }))
+    }
+
+    $rows.Add([pscustomobject][ordered]@{
+        Workload        = $Workload
+        Flags           = if ($flags.Count) { $flags -join '; ' } else { '' }
+        Site            = if ($title) { $title } else { Get-Col $R 'Owner Display Name' }
+        Url             = if ($url) { $url } else { "SiteId:$sid" }
+        Owner           = Get-Col $R 'Owner Principal Name'
+        Template        = Get-Col $R 'Root Web Template'
+        UsedGB          = [math]::Round($used / 1GB, 3)
+        AllocatedGB     = [math]::Round($alloc / 1GB, 2)
+        PctOfSiteQuota  = $pct
+        FileCount       = ConvertTo-Long (Get-Col $R 'File Count')
+        LastActivity    = if ($last) { $last.ToString('yyyy-MM-dd') } else { 'None in report' }
+        _Bytes          = $used
+    })
+}
+foreach ($r in $spoRpt) { Add-SiteRow 'SharePoint' $r }
+foreach ($r in $odbRpt) { Add-SiteRow 'OneDrive' $r }
+if (-not $meta.RefreshDate) { $meta.RefreshDate = $nowUtc.ToString('yyyy-MM-dd') }
+$refreshDate = $meta.RefreshDate
+
+$spoRows = @($rows | Where-Object Workload -eq 'SharePoint' | Sort-Object _Bytes -Descending)
+$odbRows = @($rows | Where-Object Workload -eq 'OneDrive'   | Sort-Object _Bytes -Descending)
+$spoUsed = [double](($spoRows | Measure-Object _Bytes -Sum).Sum)
+$odbUsed = [double](($odbRows | Measure-Object _Bytes -Sum).Sum)
+
+# Trend: first vs last day in the 30-day series -> growth/day -> days until quota is full
+function Get-Trend {
+    param([object[]]$Series)
+    $pts = @($Series | ForEach-Object {
+        $d = ConvertTo-Date (Get-Col $_ 'Report Date'); $b = [double](ConvertTo-Long (Get-Col $_ 'Storage Used (Byte)'))
+        if ($d -and $b -gt 0) { [pscustomobject]@{ D = $d; B = $b } }
+    } | Sort-Object D)
+    if ($pts.Count -lt 2) { return $null }
+    $days = ($pts[-1].D - $pts[0].D).TotalDays
+    if ($days -le 0) { return $null }
+    return [pscustomobject]@{ From = $pts[0]; To = $pts[-1]; Days = $days; PerDay = ($pts[-1].B - $pts[0].B) / $days }
+}
+$spoT = Get-Trend $spoTrend
+$odbT = Get-Trend $odbTrend
+
+$quotaPct = if ($quotaBytes) { Get-Pct $spoUsed $quotaBytes } else { $null }
+$freeBytes = if ($quotaBytes) { $quotaBytes - $spoUsed } else { $null }
+$daysToFull = $null
+if ($quotaBytes -and $spoT -and $spoT.PerDay -gt 0) { $daysToFull = [int][math]::Floor([math]::Max([double]0, [double]$freeBytes) / $spoT.PerDay) }
+
+$tenantStatus = 'OK'
+if ($quotaPct -ne $null) {
+    if ($quotaPct -ge $TenantCritPct) { $tenantStatus = 'CRITICAL' }
+    elseif ($quotaPct -ge $TenantWarnPct) { $tenantStatus = 'WARNING' }
+}
+if ($daysToFull -ne $null -and $daysToFull -le $ForecastWarnDays -and $tenantStatus -eq 'OK') { $tenantStatus = 'WARNING' }
+if (-not $quotaBytes) { $tenantStatus = 'UNKNOWN (no quota)' }
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- OUTPUT ----------------------------
+$stamp   = $nowUtc.ToString('yyyyMMdd-HHmm')
+$csvPath = Join-Path ([System.IO.Path]::GetTempPath()) "StorageConsumption-$stamp.csv"
+
+$summaryRows = @(
+    [pscustomobject][ordered]@{ Workload = 'TENANT'; Flags = $tenantStatus; Site = 'SharePoint total (counts against tenant quota)'; Url = ''; Owner = ''; Template = ''
+        UsedGB = [math]::Round($spoUsed / 1GB, 2); AllocatedGB = if ($quotaBytes) { [math]::Round($quotaBytes / 1GB, 2) } else { '' }
+        PctOfSiteQuota = $quotaPct; FileCount = ($spoRows | Measure-Object FileCount -Sum).Sum; LastActivity = "Quota source: $quotaSource" }
+    [pscustomobject][ordered]@{ Workload = 'TENANT'; Flags = 'Separate from SharePoint quota'; Site = 'OneDrive total'; Url = ''; Owner = ''; Template = ''
+        UsedGB = [math]::Round($odbUsed / 1GB, 2); AllocatedGB = ''; PctOfSiteQuota = ''; FileCount = ($odbRows | Measure-Object FileCount -Sum).Sum; LastActivity = "$($odbRows.Count) accounts" }
+)
+$export = @($summaryRows) + @($spoRows + $odbRows | Select-Object -Property * -ExcludeProperty _Bytes)
+$export | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding utf8
+
+$th  = 'style="background:#f0f0f0;text-align:left;padding:5px;border:1px solid #ccc"'
+$td  = 'style="padding:5px;border:1px solid #ccc"'
+$tdr = 'style="padding:5px;border:1px solid #ccc;text-align:right"'
+$statusColor = switch -Wildcard ($tenantStatus) { 'CRITICAL' { '#b00020' } 'WARNING' { '#b36b00' } 'OK' { '#1b7f3b' } default { '#555' } }
+
+$sb = New-Object System.Text.StringBuilder
+[void]$sb.Append('<html><body style="font-family:Segoe UI,Arial,sans-serif;font-size:13px;color:#222">')
+[void]$sb.Append("<h2 style='margin-bottom:4px'>SharePoint &amp; OneDrive storage - $(ConvertTo-HtmlSafe $TenantLabel)</h2>")
+[void]$sb.Append("<p style='margin-top:0;color:#555'>Figures as of the Microsoft usage report dated <b>$refreshDate</b> (reports run ~2 days behind). Full per-site list in the attached CSV.</p>")
+
+if ($gaps.Count) {
+    [void]$sb.Append('<div style="background:#fff4e5;border-left:4px solid #e08a00;padding:8px 12px;margin:10px 0"><b>Notes / data gaps:</b><ul style="margin:4px 0">')
+    foreach ($g in $gaps) { [void]$sb.Append("<li>$(ConvertTo-HtmlSafe $g)</li>") }
+    [void]$sb.Append('</ul></div>')
+}
+
+[void]$sb.Append("<h3>SharePoint vs tenant quota: <span style='color:$statusColor'>$tenantStatus</span></h3><table style='border-collapse:collapse'>")
+[void]$sb.Append("<tr><td $td>SharePoint storage used ($($spoRows.Count) sites)</td><td $tdr><b>$(Format-Bytes $spoUsed)</b></td></tr>")
+if ($quotaBytes) {
+    [void]$sb.Append("<tr><td $td>Tenant SharePoint quota</td><td $tdr>$(Format-Bytes $quotaBytes)</td></tr>")
+    [void]$sb.Append("<tr><td $td>Used</td><td style='padding:5px;border:1px solid #ccc;text-align:right;color:$statusColor;font-weight:600'>$quotaPct %</td></tr>")
+    [void]$sb.Append("<tr><td $td>Free</td><td $tdr>$(Format-Bytes ([math]::Max([double]0, [double]$freeBytes)))</td></tr>")
+    [void]$sb.Append("<tr><td $td>Quota source</td><td $td>$(ConvertTo-HtmlSafe $quotaSource)</td></tr>")
+}
+if ($spoT) {
+    $g30 = $spoT.To.B - $spoT.From.B
+    [void]$sb.Append("<tr><td $td>Growth over $([int]$spoT.Days) days</td><td $tdr>$(if ($g30 -ge 0) { '+' } else { '-' })$(Format-Bytes ([math]::Abs($g30))) ($(Format-Bytes ([math]::Abs($spoT.PerDay)))/day)</td></tr>")
+    $fc = if ($daysToFull -ne $null) { "~$daysToFull days ($($nowUtc.AddDays($daysToFull).ToString('MMM yyyy')))" } elseif ($spoT.PerDay -le 0) { 'Not growing' } else { 'n/a' }
+    [void]$sb.Append("<tr><td $td>Forecast: quota full in</td><td $tdr>$fc</td></tr>")
+}
+[void]$sb.Append('</table>')
+if ($licenceBreakdown.Count) {
+    [void]$sb.Append("<p style='color:#555;font-size:12px'>Estimate built from: $(ConvertTo-HtmlSafe ($licenceBreakdown -join '; ')). Verify once in SharePoint admin center; if it differs, grant the admin-API permission for the exact figure.</p>")
+}
+
+[void]$sb.Append("<h3>OneDrive (separate allocation, not part of the quota above)</h3><table style='border-collapse:collapse'>")
+[void]$sb.Append("<tr><td $td>OneDrive storage used ($($odbRows.Count) accounts)</td><td $tdr><b>$(Format-Bytes $odbUsed)</b></td></tr>")
+if ($odbT) { [void]$sb.Append("<tr><td $td>Growth over $([int]$odbT.Days) days</td><td $tdr>$(Format-Bytes ([math]::Abs($odbT.To.B - $odbT.From.B)))</td></tr>") }
+$odbNear = @($odbRows | Where-Object { $_.Flags -like 'Near quota*' }).Count
+[void]$sb.Append("<tr><td $td>Accounts at $SiteQuotaWarnPct%+ of their allocation</td><td $tdr>$odbNear</td></tr></table>")
+
+[void]$sb.Append("<h3>Largest SharePoint sites</h3><table style='border-collapse:collapse'><tr><th $th>Site</th><th $th>Used</th><th $th>% of site quota</th><th $th>Last activity</th><th $th>Flags</th></tr>")
+foreach ($s in ($spoRows | Select-Object -First $TopSitesInEmail)) {
+    $label = if ($s.Site) { $s.Site } else { $s.Url }
+    [void]$sb.Append("<tr><td $td><a href='$($s.Url)'>$(ConvertTo-HtmlSafe $label)</a></td><td $tdr>$(Format-Bytes $s._Bytes)</td><td $tdr>$($s.PctOfSiteQuota)</td><td $td>$($s.LastActivity)</td><td $td>$(ConvertTo-HtmlSafe $s.Flags)</td></tr>")
+}
+[void]$sb.Append('</table>')
+
+[void]$sb.Append("<h3>Largest OneDrive accounts</h3><table style='border-collapse:collapse'><tr><th $th>Owner</th><th $th>Used</th><th $th>% of allocation</th><th $th>Last activity</th><th $th>Flags</th></tr>")
+foreach ($s in ($odbRows | Select-Object -First $TopOneDrivesInEmail)) {
+    $label = if ($s.Owner) { $s.Owner } elseif ($s.Site) { $s.Site } else { $s.Url }
+    [void]$sb.Append("<tr><td $td>$(ConvertTo-HtmlSafe $label)</td><td $tdr>$(Format-Bytes $s._Bytes)</td><td $tdr>$($s.PctOfSiteQuota)</td><td $td>$($s.LastActivity)</td><td $td>$(ConvertTo-HtmlSafe $s.Flags)</td></tr>")
+}
+[void]$sb.Append('</table>')
+
+$archive = @($spoRows | Where-Object { $_.Flags -like '*Archive candidate*' })
+if ($archive.Count) {
+    $archBytes = [double](($archive | Measure-Object _Bytes -Sum).Sum)
+    [void]$sb.Append("<p><b>$($archive.Count) SharePoint sites</b> over $ArchiveCandidateGB GB with no activity for $InactiveDays+ days hold <b>$(Format-Bytes $archBytes)</b> - candidates for Microsoft 365 Archive or clean-up (see CSV Flags).</p>")
+}
+[void]$sb.Append("<p style='color:#888;font-size:11px'>Generated by Runbook 19 (19-Review-StorageConsumption.ps1), Azure Automation, managed identity. OneDrive does not consume the SharePoint tenant quota. Recycle bin and version history count towards each site's usage.</p></body></html>")
+$html = $sb.ToString()
+
+Write-Output ("SharePoint used {0} of {1} ({2}%) - {3}. OneDrive used {4} across {5} accounts." -f `
+    (Format-Bytes $spoUsed), $(if ($quotaBytes) { Format-Bytes $quotaBytes } else { 'unknown quota' }), $quotaPct, $tenantStatus, (Format-Bytes $odbUsed), $odbRows.Count)
+if ($daysToFull -ne $null) { Write-Output "Forecast: SharePoint quota full in ~$daysToFull days." }
+foreach ($g in $gaps) { Write-Output "  NOTE: $g" }
+
+if ($SendEmail) {
+    $flag    = if ($tenantStatus -in 'CRITICAL','WARNING') { "[$tenantStatus $quotaPct%] " } else { '' }
+    $subject = "${flag}SharePoint & OneDrive storage - $TenantLabel - $($nowUtc.ToString('yyyy-MM-dd'))"
+    try {
+        Send-ReportEmail -From $SenderMailbox -To $Recipients -Subject $subject -HtmlBody $html -AttachmentPath $csvPath
+        Write-Output "Report emailed to $($Recipients -join ', ')."
+    }
+    catch {
+        Write-Error "sendMail failed from $SenderMailbox. Check Mail.Send and the application access policy scope. $($_.Exception.Message)"
+        throw
+    }
+    foreach ($p in @($csvPath, [System.IO.Path]::ChangeExtension($csvPath, '.zip'))) { if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue } }
+}
+else { Write-Output "SendEmail is off. CSV written to $csvPath." }
+#endregion -------------------------------------------------------------

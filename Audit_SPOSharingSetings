@@ -1,0 +1,483 @@
+<#
+.SYNOPSIS
+    Runbook 16 - SharePoint Online external sharing configuration review (tenant + site level).
+
+.DESCRIPTION
+    Read-only. Evaluates what external sharing is ALLOWED - the configuration - against a
+    baseline, at tenant level and for every site. Changes nothing.
+
+    Companion to Runbook 9, which reports what IS shared (actual anonymous / org-wide /
+    guest links). This one answers "what could be shared". Read the two together: a site
+    allowing Anyone links with none in Runbook 9 is a config fix; one with live links is a
+    content clean-up too.
+
+    TENANT checks (Get-PnPTenant) - each gets Pass / Warn / Fail / Info
+      SharePoint and OneDrive sharing level, default link type and permission, Anyone-link
+      expiry and file/folder permissions, external resharing, invited-account matching,
+      guest access expiry, guest re-verification, domain allow/block list, Everyone claims
+      in the people picker, unmanaged-device policy.
+
+    SITE checks (Get-PnPTenantSite) - one row per site, worst status wins, all reasons listed
+      - Anyone links allowed (Fail if the site looks sensitive or is not on the approved list)
+      - New guest invites allowed on a sensitive or unapproved site
+      - Default link type = Anyone
+      - Site overrides the tenant Anyone-link expiry with no expiry
+      - Site overrides the tenant guest-expiry policy with none / too long
+      Plus a distribution of all sites by sharing level.
+
+    "Approved" = the site is on $ApprovedExternalSites - the list of sites the client has
+    signed off for external collaboration. Keep it maintained or every collaboration site
+    shows as Warn.
+
+.NOTES
+    Auth         : Automation Account system-assigned Managed Identity.
+                   PnP: Connect-PnPOnline -Url <tenant>-admin.sharepoint.com -ManagedIdentity
+                   Mail: MI token for Graph from the sandbox's IDENTITY_ENDPOINT + REST sendMail.
+                   The Microsoft.Graph module is deliberately NOT loaded here - PnP.PowerShell
+                   and Microsoft.Graph.* ship conflicting MSAL/Azure.Identity assemblies and
+                   loading both in one job is a known source of "Could not load file or
+                   assembly" failures.
+    Permissions  : SharePoint API (Office 365 SharePoint Online) application permission
+                   Sites.FullControl.All  - required by the SPO admin endpoints for app-only.
+                   There is no read-only permission that reaches them. The Entra "SharePoint
+                   Administrator" directory role does NOT substitute for it with app-only PnP.
+                   Microsoft Graph Mail.Send (granted).
+    Modules      : PnP.PowerShell PINNED 2.12.0 (v3.x needs PS 7.4.6+, not available in
+                   Azure Automation). No Microsoft.Graph modules.
+    Schedule     : quarterly per the maintenance sheet (Monthly recurrence, every 3 months).
+
+    UNVERIFIED - settle on the first test run:
+      1. Exact property names on the PnP 2.12 Tenant object for OneDrive sharing level
+         (script tries OneDriveSharingCapability then ODBSharingCapability). Any property
+         that comes back missing is reported as "Not returned", never silently as Pass.
+      2. Whether link-default properties (DefaultSharingLinkType etc.) are populated by the
+         bulk Get-PnPTenantSite call or need -Detailed. If they come back empty, set
+         $DetailedSiteProperties = $true (slower - one extra call per site).
+#>
+
+#region ---------------------------- CONFIG ----------------------------
+$TenantLabel            = 'CrucialLogics'
+$TenantAdminUrl         = 'https://contoso-admin.sharepoint.com'   # MUST be the -admin URL
+$SenderMailbox          = 'm365-audits@cruciallogics.com'
+$Recipients             = @('replace-me@cruciallogics.com')
+
+# Baseline
+$AllowAnyoneLinksTenant = $false  # $true if the client has knowingly signed off on Anyone links
+$MaxAnyoneLinkDays      = 30      # Anyone links should expire within this many days
+$MaxGuestAccessDays     = 90      # guest access expiry ceiling
+$MaxReauthDays          = 30      # guest email re-verification ceiling
+$FlagUnapprovedGuestSharing = $true  # Warn on sites allowing NEW guests that aren't on the approved list
+
+# Sites the client has approved for external collaboration (wildcards OK)
+$ApprovedExternalSites  = @(
+    # 'https://contoso.sharepoint.com/sites/partner-*'
+)
+
+# Sites treated as sensitive: URL/title patterns and/or sensitivity label GUIDs
+# Whole-word regex against site URL and title ("hr" matches /sites/hr-team and "HR Portal", not "threads")
+$SensitiveSiteRegex     = '(?i)\b(finance|payroll|hr|human[\s-]?resources|legal|board|exec|executive|confidential|m&a|merger|acquisition)\b'
+$SensitiveLabelIds      = @()     # e.g. '2a1b...' GUIDs of Confidential / Highly Confidential labels
+
+$IncludeOneDrive        = $false  # OneDrive sites = one per user; big and noisy. Tenant-level OneDrive setting is checked regardless.
+$ExcludeTemplates       = @('SRCHCEN#0','SPSMSITEHOST#0','APPCATALOG#0','POINTPUBLISHINGHUB#0',
+                            'EDISC#0','REDIRECTSITE#0','SPSPERS#10','RedirectSite#0')
+$DetailedSiteProperties = $false  # see UNVERIFIED #2
+$MaxSitesToProcess      = 0       # 0 = all
+$TopSitesInEmail        = 25
+$SendEmail              = $true
+#endregion -------------------------------------------------------------
+
+$ErrorActionPreference = 'Stop'
+
+#region ---------------------------- HELPERS ---------------------------
+function Get-MIGraphToken {
+    if (-not $env:IDENTITY_ENDPOINT -or -not $env:IDENTITY_HEADER) {
+        throw 'IDENTITY_ENDPOINT / IDENTITY_HEADER not set. This script must run in Azure Automation with the system-assigned managed identity enabled.'
+    }
+    $uri = "$($env:IDENTITY_ENDPOINT)?resource=https://graph.microsoft.com/&api-version=2019-08-01"
+    $resp = Invoke-RestMethod -Method GET -Uri $uri -Headers @{ 'X-IDENTITY-HEADER' = $env:IDENTITY_HEADER; 'Metadata' = 'True' }
+    return $resp.access_token
+}
+
+# REST version of Send-ReportEmail (no Microsoft.Graph module - see NOTES)
+function Send-ReportEmail {
+    param(
+        [Parameter(Mandatory)] [string]   $From,
+        [Parameter(Mandatory)] [string[]] $To,
+        [Parameter(Mandatory)] [string]   $Subject,
+        [Parameter(Mandatory)] [string]   $HtmlBody,
+        [string] $AttachmentPath
+    )
+    $message = @{
+        subject      = $Subject
+        body         = @{ contentType = 'HTML'; content = $HtmlBody }
+        toRecipients = @($To | ForEach-Object { @{ emailAddress = @{ address = $_ } } })
+    }
+    if ($AttachmentPath -and (Test-Path -LiteralPath $AttachmentPath)) {
+        $bytes = [System.IO.File]::ReadAllBytes($AttachmentPath)
+        if ($bytes.Length -gt 3MB) {
+            Write-Warning "Attachment is $([math]::Round($bytes.Length / 1MB, 2)) MB, over the 3 MB sendMail limit. Sending without it."
+        }
+        else {
+            $message.attachments = @(@{
+                '@odata.type' = '#microsoft.graph.fileAttachment'
+                name          = [System.IO.Path]::GetFileName($AttachmentPath)
+                contentType   = 'text/csv'
+                contentBytes  = [System.Convert]::ToBase64String($bytes)
+            })
+        }
+    }
+    $payload = @{ message = $message; saveToSentItems = $false } | ConvertTo-Json -Depth 10
+    $token = Get-MIGraphToken
+    Invoke-RestMethod -Method POST -Uri "https://graph.microsoft.com/v1.0/users/$From/sendMail" `
+        -Headers @{ Authorization = "Bearer $token" } -Body $payload -ContentType 'application/json' | Out-Null
+}
+
+# Read a property defensively; $null if the object doesn't have it. Collections -> '; ' joined.
+function Get-Val {
+    param($Obj, [string[]]$Names)
+    foreach ($n in $Names) {
+        $p = $Obj.PSObject.Properties[$n]
+        if (-not $p) { continue }
+        $v = $p.Value
+        if ($null -eq $v) { return $null }
+        if ($v -is [System.Collections.IEnumerable] -and $v -isnot [string]) { return (@($v) -join '; ') }
+        return "$v"
+    }
+    return $null
+}
+
+function Get-CapRank {
+    param([string]$Cap)
+    switch ($Cap) {
+        'Disabled'                         { 0 }
+        'ExistingExternalUserSharingOnly'  { 1 }
+        'ExternalUserSharingOnly'          { 2 }
+        'ExternalUserAndGuestSharing'      { 3 }
+        default                            { -1 }
+    }
+}
+
+function Get-CapLabel {
+    param([string]$Cap)
+    switch ($Cap) {
+        'Disabled'                         { 'Only people in the organization' }
+        'ExistingExternalUserSharingOnly'  { 'Existing guests only' }
+        'ExternalUserSharingOnly'          { 'New and existing guests' }
+        'ExternalUserAndGuestSharing'      { 'Anyone (links without sign-in)' }
+        default                            { if ($Cap) { $Cap } else { 'Not returned' } }
+    }
+}
+
+function Test-True { param($v) return ("$v" -eq 'True') }
+
+function Test-Matches {
+    param([string[]]$Values, [string[]]$Patterns)
+    foreach ($v in $Values) { if (-not $v) { continue }
+        foreach ($p in $Patterns) { if ($v -like $p) { return $true } } }
+    return $false
+}
+
+function Get-StatusRank { param([string]$s) switch ($s) { 'Fail' { 1 } 'Warn' { 2 } 'Info' { 3 } default { 9 } } }
+
+function ConvertTo-HtmlSafe { param([string]$Text) [System.Net.WebUtility]::HtmlEncode($Text) }
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- CONNECT ---------------------------
+$nowUtc = [datetime]::UtcNow
+Write-Output "Runbook 16 - SPO external sharing configuration review. $($nowUtc.ToString('yyyy-MM-dd HH:mm')) UTC."
+
+if ($TenantAdminUrl -notmatch '-admin\.sharepoint\.') {
+    throw "TenantAdminUrl must be the admin center URL (https://<tenant>-admin.sharepoint.com). Got: $TenantAdminUrl"
+}
+try {
+    Import-Module PnP.PowerShell -RequiredVersion 2.12.0 -ErrorAction Stop
+    Connect-PnPOnline -Url $TenantAdminUrl -ManagedIdentity -ErrorAction Stop
+}
+catch {
+    Write-Error ("PnP connection to $TenantAdminUrl failed. Check: PnP.PowerShell 2.12.0 is imported in the Automation Account, " +
+        "and the MI has the SharePoint API application permission Sites.FullControl.All. $($_.Exception.Message)")
+    throw
+}
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- TENANT ----------------------------
+$rows = New-Object System.Collections.Generic.List[object]
+
+function Add-TenantCheck {
+    param([string]$Setting, $Current, [string]$Recommended, [string]$Status, [string]$Why)
+    if ($null -eq $Current -or "$Current" -eq '') { $Current = 'Not returned'; if ($Status -eq 'Pass') { $Status = 'Info' } }
+    $rows.Add([pscustomobject][ordered]@{
+        Priority = Get-StatusRank $Status; Status = $Status; RowType = 'Tenant'
+        Setting = $Setting; CurrentValue = "$Current"; Recommended = $Recommended
+        SiteTitle = ''; SiteUrl = ''; Template = ''; TeamsConnected = ''; SensitivityLabel = ''
+        SharingLevel = ''; DefaultLinkType = ''; DefaultLinkPermission = ''
+        AnyoneLinkExpiryDays = ''; GuestExpiryDays = ''; DomainRestriction = ''
+        ApprovedForExternal = ''; LooksSensitive = ''; Owner = ''
+        Findings = $Why
+    })
+}
+
+try { $t = Get-PnPTenant }
+catch { Write-Error "Get-PnPTenant failed: $($_.Exception.Message)"; throw }
+
+$spoCap   = Get-Val $t 'SharingCapability'
+$odbCap   = Get-Val $t 'OneDriveSharingCapability','ODBSharingCapability'
+$spoRank  = Get-CapRank $spoCap
+$odbRank  = Get-CapRank $odbCap
+$anyoneOn = ($spoRank -eq 3) -or ($odbRank -eq 3)
+
+# 1-2. Sharing level
+foreach ($pair in @(@{ N = 'SharePoint sharing level'; C = $spoCap; R = $spoRank }, @{ N = 'OneDrive sharing level'; C = $odbCap; R = $odbRank })) {
+    $st = 'Pass'; $why = 'Within baseline.'
+    if ($pair.R -eq 3) {
+        if ($AllowAnyoneLinksTenant) { $st = 'Info'; $why = 'Anyone links allowed - client sign-off recorded in CONFIG.' }
+        else { $st = 'Fail'; $why = 'Anyone links (no sign-in) allowed. Content can leave the org with no identity attached. Lower to New and existing guests unless signed off.' }
+    }
+    elseif ($pair.R -lt 0) { $st = 'Info'; $why = 'Value not recognised or not returned.' }
+    Add-TenantCheck $pair.N (Get-CapLabel $pair.C) 'New and existing guests or lower' $st $why
+}
+if ($spoRank -ge 0 -and $odbRank -gt $spoRank) {
+    Add-TenantCheck 'OneDrive vs SharePoint level' "$(Get-CapLabel $odbCap) vs $(Get-CapLabel $spoCap)" 'OneDrive no more permissive than SharePoint' 'Warn' 'OneDrive is more permissive than SharePoint - users can bypass site controls by sharing from their own OneDrive.'
+}
+
+# 3-4. Default link type and permission
+$defType = Get-Val $t 'DefaultSharingLinkType'
+switch ($defType) {
+    'AnonymousAccess' { Add-TenantCheck 'Default link type' $defType 'Direct (specific people)' 'Fail' 'Default link is Anyone. Every quick share creates an anonymous link.' }
+    'Internal'        { Add-TenantCheck 'Default link type' $defType 'Direct (specific people)' 'Warn' 'Default is People in your organization. Main driver of internal oversharing, and what Copilot surfaces.' }
+    'Direct'          { Add-TenantCheck 'Default link type' $defType 'Direct (specific people)' 'Pass' 'Within baseline.' }
+    default           { Add-TenantCheck 'Default link type' $defType 'Direct (specific people)' 'Info' 'Unexpected or unset value - check in the SharePoint admin center.' }
+}
+$defPerm = Get-Val $t 'DefaultLinkPermission'
+Add-TenantCheck 'Default link permission' $defPerm 'View' $(if ($defPerm -eq 'Edit') { 'Warn' } elseif ($defPerm -eq 'View') { 'Pass' } else { 'Info' }) `
+    $(if ($defPerm -eq 'Edit') { 'Links default to Edit. Most shares only need View.' } else { 'Within baseline.' })
+
+# 5-6. Anyone-link expiry and permissions (only meaningful if Anyone is allowed)
+$anonDays = Get-Val $t 'RequireAnonymousLinksExpireInDays'
+if ($anyoneOn) {
+    $d = 0; [void][int]::TryParse("$anonDays", [ref]$d)
+    if ($d -le 0)                     { Add-TenantCheck 'Anyone link expiry (days)' $anonDays "1-$MaxAnyoneLinkDays" 'Fail' 'Anyone links are allowed and never expire.' }
+    elseif ($d -gt $MaxAnyoneLinkDays){ Add-TenantCheck 'Anyone link expiry (days)' $anonDays "1-$MaxAnyoneLinkDays" 'Warn' "Anyone links live longer than $MaxAnyoneLinkDays days." }
+    else                              { Add-TenantCheck 'Anyone link expiry (days)' $anonDays "1-$MaxAnyoneLinkDays" 'Pass' 'Within baseline.' }
+
+    foreach ($pn in @('FileAnonymousLinkType','FolderAnonymousLinkType')) {
+        $v = Get-Val $t $pn
+        Add-TenantCheck $pn $v 'View' $(if ($v -eq 'Edit') { 'Warn' } elseif ($v -eq 'View') { 'Pass' } else { 'Info' }) `
+            $(if ($v -eq 'Edit') { 'Anyone links can grant Edit - anonymous users can change or upload content.' } else { 'Within baseline.' })
+    }
+}
+else {
+    Add-TenantCheck 'Anyone link expiry (days)' $(if ($anonDays) { $anonDays } else { 'n/a' }) 'n/a' 'Pass' 'Anyone links are disabled - expiry not applicable.'
+}
+
+# 7-8. Resharing and account matching
+$reshare = Get-Val $t 'PreventExternalUsersFromResharing'
+Add-TenantCheck 'Prevent guests from resharing' $reshare 'True' $(if (Test-True $reshare) { 'Pass' } elseif ($reshare) { 'Fail' } else { 'Info' }) `
+    $(if (Test-True $reshare) { 'Within baseline.' } else { 'Guests can reshare content they don''t own with further external people.' })
+$match = Get-Val $t 'RequireAcceptingAccountMatchInvitedAccount'
+Add-TenantCheck 'Guest must accept with invited account' $match 'True' $(if (Test-True $match) { 'Pass' } elseif ($match) { 'Fail' } else { 'Info' }) `
+    $(if (Test-True $match) { 'Within baseline.' } else { 'An invitation forwarded to someone else can be redeemed by them.' })
+
+# 9. Guest access expiry
+$expReq  = Get-Val $t 'ExternalUserExpirationRequired'
+$expDays = Get-Val $t 'ExternalUserExpireInDays'
+if (-not (Test-True $expReq)) {
+    Add-TenantCheck 'Guest access expiry' $(if ($expReq) { "Off" } else { $null }) "On, <= $MaxGuestAccessDays days" $(if ($expReq) { 'Warn' } else { 'Info' }) 'Guest access to sites never expires; stale guests keep access indefinitely.'
+}
+else {
+    $d = 0; [void][int]::TryParse("$expDays", [ref]$d)
+    Add-TenantCheck 'Guest access expiry' "On, $expDays days" "On, <= $MaxGuestAccessDays days" $(if ($d -gt $MaxGuestAccessDays) { 'Warn' } else { 'Pass' }) `
+        $(if ($d -gt $MaxGuestAccessDays) { "Expiry longer than $MaxGuestAccessDays days." } else { 'Within baseline.' })
+}
+
+# 10. Guest re-verification
+$att     = Get-Val $t 'EmailAttestationRequired'
+$attDays = Get-Val $t 'EmailAttestationReAuthDays'
+if (-not (Test-True $att)) {
+    Add-TenantCheck 'Guest re-verification' $(if ($att) { 'Off' } else { $null }) "On, <= $MaxReauthDays days" $(if ($att) { 'Warn' } else { 'Info' }) 'Guests using verification codes are never asked to re-verify.'
+}
+else {
+    $d = 0; [void][int]::TryParse("$attDays", [ref]$d)
+    Add-TenantCheck 'Guest re-verification' "On, $attDays days" "On, <= $MaxReauthDays days" $(if ($d -gt $MaxReauthDays) { 'Warn' } else { 'Pass' }) `
+        $(if ($d -gt $MaxReauthDays) { "Re-verification interval longer than $MaxReauthDays days." } else { 'Within baseline.' })
+}
+
+# 11. Domain restriction
+$domMode = Get-Val $t 'SharingDomainRestrictionMode'
+switch ($domMode) {
+    'AllowList' { Add-TenantCheck 'Domain restriction' "AllowList: $(Get-Val $t 'SharingAllowedDomainList')" 'AllowList or BlockList' 'Pass' 'Sharing limited to approved domains.' }
+    'BlockList' { Add-TenantCheck 'Domain restriction' "BlockList: $(Get-Val $t 'SharingBlockedDomainList')" 'AllowList or BlockList' 'Pass' 'Blocked domains in place. Allow list is stricter if the partner set is stable.' }
+    default     { Add-TenantCheck 'Domain restriction' $domMode 'AllowList or BlockList' 'Info' 'No domain restriction - guests from any domain. Consider a block list for personal-mail domains at minimum.' }
+}
+
+# 12. Everyone claims in the people picker
+foreach ($pn in @('ShowEveryoneExceptExternalUsersClaim','ShowEveryoneClaim','ShowAllUsersClaim')) {
+    $v = Get-Val $t $pn
+    Add-TenantCheck $pn $v 'False' $(if (Test-True $v) { 'Info' } elseif ($v) { 'Pass' } else { 'Info' }) `
+        $(if (Test-True $v) { 'Users can grant whole-org access in one click - common oversharing path, and exactly what Copilot then surfaces.' } else { 'Within baseline.' })
+}
+
+# 13. Unmanaged devices
+$ca = Get-Val $t 'ConditionalAccessPolicy'
+Add-TenantCheck 'Unmanaged device access' $ca 'AllowLimitedAccess or BlockAccess' $(if ($ca -eq 'AllowFullAccess') { 'Info' } elseif ($ca) { 'Pass' } else { 'Info' }) `
+    $(if ($ca -eq 'AllowFullAccess') { 'Unmanaged devices can download and sync everything. Not a sharing setting strictly, but decides where shared content ends up.' } else { 'Within baseline.' })
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- SITES -----------------------------
+$getParams = @{}
+if ($IncludeOneDrive) { $getParams['IncludeOneDriveSites'] = $true }
+if ($DetailedSiteProperties) { $getParams['Detailed'] = $true }
+try { $allSites = @(Get-PnPTenantSite @getParams) }
+catch { Write-Error "Get-PnPTenantSite failed: $($_.Exception.Message)"; throw }
+
+$sites = @($allSites | Where-Object { $ExcludeTemplates -notcontains (Get-Val $_ 'Template') })
+$totalSites = $sites.Count
+$gaps = New-Object System.Collections.Generic.List[string]
+if ($MaxSitesToProcess -gt 0 -and $sites.Count -gt $MaxSitesToProcess) {
+    $gaps.Add("TEST MODE: only $MaxSitesToProcess of $totalSites sites evaluated.")
+    $sites = @($sites | Select-Object -First $MaxSitesToProcess)
+}
+Write-Output "Evaluating $($sites.Count) sites."
+
+$linkTypeSeen = $false
+foreach ($s in $sites) {
+    $url     = Get-Val $s 'Url'
+    $title   = Get-Val $s 'Title'
+    $cap     = Get-Val $s 'SharingCapability'
+    $rank    = Get-CapRank $cap
+    $label   = Get-Val $s 'SensitivityLabel'
+    $defLink = Get-Val $s 'DefaultSharingLinkType'
+    $defPermS= Get-Val $s 'DefaultLinkPermission'
+    if ($defLink) { $linkTypeSeen = $true }
+    $anonOverride = Test-True (Get-Val $s 'OverrideTenantAnonymousLinkExpirationPolicy')
+    $anonDaysS    = Get-Val $s 'AnonymousLinkExpirationInDays'
+    $guestOverride= Test-True (Get-Val $s 'OverrideTenantExternalUserExpirationPolicy')
+    $guestDaysS   = Get-Val $s 'ExternalUserExpirationInDays'
+    $groupId      = Get-Val $s 'GroupId'
+    $teams        = ($groupId -and $groupId -ne '00000000-0000-0000-0000-000000000000')
+
+    $approved  = Test-Matches @($url) $ApprovedExternalSites
+    $sensitive = ($url -match $SensitiveSiteRegex) -or ($title -match $SensitiveSiteRegex) -or [bool]($label -and ($SensitiveLabelIds -contains $label))
+
+    # Reference-type state so the scriptblock updates it regardless of scope
+    $state = @{ Worst = 'Pass'; Issues = (New-Object System.Collections.Generic.List[string]) }
+    $raise = { param($st, $msg)
+        $state.Issues.Add("[$st] $msg")
+        if ((Get-StatusRank $st) -lt (Get-StatusRank $state.Worst)) { $state.Worst = $st }
+    }
+
+    if ($rank -eq 3) {
+        if ($sensitive)      { & $raise 'Fail' 'Anyone links allowed on a site that looks sensitive.' }
+        elseif (-not $approved) { & $raise 'Fail' 'Anyone links allowed; site not on the approved external list.' }
+        else                 { & $raise 'Warn' 'Anyone links allowed (approved site) - confirm still needed.' }
+    }
+    elseif ($rank -eq 2) {
+        if ($sensitive -and -not $approved)             { & $raise 'Fail' 'New guest invites allowed on a site that looks sensitive.' }
+        elseif (-not $approved -and $FlagUnapprovedGuestSharing) { & $raise 'Warn' 'New guest invites allowed; site not on the approved external list.' }
+    }
+    elseif ($rank -eq 1 -and $sensitive) { & $raise 'Info' 'Sensitive-looking site shares with existing guests.' }
+    elseif ($rank -lt 0) { & $raise 'Info' "Sharing level not returned or unrecognised ($cap)." }
+
+    if ($defLink -eq 'AnonymousAccess') { & $raise 'Fail' 'Site default link type is Anyone.' }
+    elseif ($defLink -eq 'Internal' -and $sensitive) { & $raise 'Warn' 'Sensitive-looking site defaults to org-wide links.' }
+
+    if ($rank -eq 3 -and $anonOverride) {
+        $d = 0; [void][int]::TryParse("$anonDaysS", [ref]$d)
+        if ($d -le 0) { & $raise 'Fail' 'Site overrides tenant Anyone-link expiry with no expiry.' }
+        elseif ($d -gt $MaxAnyoneLinkDays) { & $raise 'Warn' "Site Anyone-link expiry $d days (> $MaxAnyoneLinkDays)." }
+    }
+    if ($rank -ge 1 -and $guestOverride) {
+        $d = 0; [void][int]::TryParse("$guestDaysS", [ref]$d)
+        if ($d -le 0 -or $d -gt $MaxGuestAccessDays) { & $raise 'Warn' "Site overrides tenant guest expiry ($guestDaysS days)." }
+    }
+
+    $rows.Add([pscustomobject][ordered]@{
+        Priority = Get-StatusRank $state.Worst; Status = $state.Worst; RowType = 'Site'
+        Setting = ''; CurrentValue = ''; Recommended = ''
+        SiteTitle = $title; SiteUrl = $url; Template = Get-Val $s 'Template'; TeamsConnected = $teams
+        SensitivityLabel = $label; SharingLevel = Get-CapLabel $cap
+        DefaultLinkType = $defLink; DefaultLinkPermission = $defPermS
+        AnyoneLinkExpiryDays = if ($anonOverride) { "$anonDaysS (site override)" } else { 'tenant' }
+        GuestExpiryDays = if ($guestOverride) { "$guestDaysS (site override)" } else { 'tenant' }
+        DomainRestriction = Get-Val $s 'SharingDomainRestrictionMode'
+        ApprovedForExternal = $approved; LooksSensitive = $sensitive; Owner = Get-Val $s 'Owner'
+        Findings = if ($state.Issues.Count) { $state.Issues -join ' | ' } else { 'Within baseline.' }
+    })
+}
+if (-not $linkTypeSeen -and $sites.Count -gt 0) {
+    $gaps.Add('Site default link type/permission came back empty for every site - site-level link checks did not run. Set $DetailedSiteProperties = $true and re-run.')
+}
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- OUTPUT ----------------------------
+$sorted = @($rows | Sort-Object Priority, @{ Expression = { if ($_.RowType -eq 'Tenant') { 0 } else { 1 } } }, SiteUrl, Setting)
+$tenantRows = @($sorted | Where-Object RowType -eq 'Tenant')
+$siteRows   = @($sorted | Where-Object RowType -eq 'Site')
+$tFail = @($tenantRows | Where-Object Status -eq 'Fail').Count
+$tWarn = @($tenantRows | Where-Object Status -eq 'Warn').Count
+$sFail = @($siteRows | Where-Object Status -eq 'Fail').Count
+$sWarn = @($siteRows | Where-Object Status -eq 'Warn').Count
+
+$stamp   = $nowUtc.ToString('yyyyMMdd-HHmm')
+$csvPath = Join-Path ([System.IO.Path]::GetTempPath()) "SPOSharingConfig-$stamp.csv"
+$sorted | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding utf8
+
+$th  = 'style="background:#f0f0f0;text-align:left;padding:5px;border:1px solid #ccc"'
+$td  = 'style="padding:5px;border:1px solid #ccc"'
+$tdr = 'style="padding:5px;border:1px solid #ccc;text-align:right"'
+$statusStyle = @{ Fail = 'color:#b00020;font-weight:600'; Warn = 'color:#b36b00;font-weight:600'; Info = 'color:#555'; Pass = 'color:#1b7f3b' }
+
+$sb = New-Object System.Text.StringBuilder
+[void]$sb.Append('<html><body style="font-family:Segoe UI,Arial,sans-serif;font-size:13px;color:#222">')
+[void]$sb.Append("<h2 style='margin-bottom:4px'>SharePoint external sharing review - $(ConvertTo-HtmlSafe $TenantLabel)</h2>")
+[void]$sb.Append("<p style='margin-top:0;color:#555'>What external sharing is <i>allowed</i>, tenant and site level. Read-only. For what is actually shared, see the Runbook 9 report. Full detail in the attached CSV.</p>")
+
+if ($gaps.Count -gt 0) {
+    [void]$sb.Append('<div style="background:#fff4e5;border-left:4px solid #e08a00;padding:8px 12px;margin:10px 0"><b>Data gaps:</b><ul style="margin:4px 0">')
+    foreach ($g in $gaps) { [void]$sb.Append("<li>$(ConvertTo-HtmlSafe $g)</li>") }
+    [void]$sb.Append('</ul></div>')
+}
+
+[void]$sb.Append("<h3>Tenant settings ($tFail fail, $tWarn warn)</h3><table style='border-collapse:collapse'><tr><th $th>Status</th><th $th>Setting</th><th $th>Current</th><th $th>Recommended</th><th $th>Why</th></tr>")
+foreach ($r in $tenantRows) {
+    [void]$sb.Append("<tr><td style='padding:5px;border:1px solid #ccc;$($statusStyle[$r.Status])'>$($r.Status)</td><td $td>$(ConvertTo-HtmlSafe $r.Setting)</td><td $td>$(ConvertTo-HtmlSafe $r.CurrentValue)</td><td $td>$(ConvertTo-HtmlSafe $r.Recommended)</td><td $td>$(ConvertTo-HtmlSafe $r.Findings)</td></tr>")
+}
+[void]$sb.Append('</table>')
+
+$dist = @($siteRows | Group-Object SharingLevel | Sort-Object Count -Descending)
+[void]$sb.Append("<h3>Sites by sharing level ($($siteRows.Count) sites: $sFail fail, $sWarn warn)</h3><table style='border-collapse:collapse'><tr><th $th>Sharing level</th><th $th>Sites</th></tr>")
+foreach ($d in $dist) { [void]$sb.Append("<tr><td $td>$(ConvertTo-HtmlSafe $d.Name)</td><td $tdr>$($d.Count)</td></tr>") }
+[void]$sb.Append('</table>')
+
+$topSites = @($siteRows | Where-Object { $_.Priority -le 2 } | Select-Object -First $TopSitesInEmail)
+if ($topSites.Count -gt 0) {
+    [void]$sb.Append("<h3>Sites needing attention (top $TopSitesInEmail)</h3><table style='border-collapse:collapse'><tr><th $th>Status</th><th $th>Site</th><th $th>Sharing level</th><th $th>Findings</th></tr>")
+    foreach ($r in $topSites) {
+        [void]$sb.Append("<tr><td style='padding:5px;border:1px solid #ccc;$($statusStyle[$r.Status])'>$($r.Status)</td><td $td><a href='$($r.SiteUrl)'>$(ConvertTo-HtmlSafe $r.SiteTitle)</a></td><td $td>$(ConvertTo-HtmlSafe $r.SharingLevel)</td><td $td>$(ConvertTo-HtmlSafe $r.Findings)</td></tr>")
+    }
+    [void]$sb.Append('</table>')
+}
+[void]$sb.Append("<p style='color:#888;font-size:11px'>Generated by Runbook 16 (16-Review-SPOSharingConfiguration.ps1), Azure Automation, managed identity. ""Looks sensitive"" is a name/label heuristic from CONFIG, not a classification.</p></body></html>")
+$html = $sb.ToString()
+
+Write-Output ("Tenant: {0} fail, {1} warn. Sites: {2} evaluated, {3} fail, {4} warn." -f $tFail, $tWarn, $siteRows.Count, $sFail, $sWarn)
+foreach ($g in $gaps) { Write-Output "  DATA GAP: $g" }
+
+if ($SendEmail) {
+    $flag    = if (($tFail + $sFail) -gt 0) { "[$($tFail + $sFail) fail] " } else { '' }
+    $subject = "${flag}SharePoint external sharing review - $TenantLabel - $($nowUtc.ToString('yyyy-MM-dd'))"
+    try {
+        Send-ReportEmail -From $SenderMailbox -To $Recipients -Subject $subject -HtmlBody $html -AttachmentPath $csvPath
+        Write-Output "Report emailed to $($Recipients -join ', ')."
+    }
+    catch {
+        Write-Error "sendMail failed from $SenderMailbox. Check Mail.Send and the application access policy scope. $($_.Exception.Message)"
+        throw
+    }
+    Remove-Item -LiteralPath $csvPath -Force -ErrorAction SilentlyContinue
+}
+else { Write-Output "SendEmail is off. CSV written to $csvPath." }
+
+Disconnect-PnPOnline -ErrorAction SilentlyContinue
+#endregion -------------------------------------------------------------

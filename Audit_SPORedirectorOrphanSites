@@ -1,0 +1,479 @@
+<#
+.SYNOPSIS
+    Runbook 22 - SharePoint Online orphaned-site and redirect-site review.
+
+.DESCRIPTION
+    Read-only. Finds sites nobody owns any more and leftover redirect sites, and says what to do
+    with each one. Changes nothing.
+
+    ORPHANED SITES
+      Group-connected (M365 group / Team) sites - owner = group owner (Graph, always runs):
+        1  No owners at all
+        1  Every owner is disabled or deleted
+        1  Site still points at a group that no longer exists              (PnP mode)
+        2  Owned only by guests, or only by apps/service principals
+        3  Single owner (one leaver away from orphaned)
+        3  Group soft-deleted - site will be deleted with it in <= 30 days  (PnP mode)
+      Non-group sites (classic team, communication, etc.)                    (PnP mode)
+        1  No usable admin: primary admin missing/disabled AND no enabled secondary admin
+        3  Primary admin gone, but an enabled secondary admin exists (fix the primary)
+
+    REDIRECT SITES (template REDIRECTSITE#0 - left behind by site URL changes)  (PnP mode)
+        2  Redirect target no longer exists (link goes nowhere)
+        3  Redirect older than $RedirectReviewDays days (review - deleting breaks old links)
+        5  Redirect in use, target healthy (listed for inventory)
+
+    Every orphan row gets an ACTION based on activity:
+      active in the last $InactiveDays days  -> "Assign an owner now"
+      inactive                               -> "Archive (Microsoft 365 Archive) or delete after owner confirmation"
+
+    MODES
+      Graph-only (default today): group-connected sites only. Non-group sites and redirects are
+        listed as not covered in "Data gaps".
+      PnP mode ($UseSharePointAdminApi): adds non-group sites, missing-group sites and redirects.
+        Needs the SharePoint API permission Sites.FullControl.All (same CR decision as
+        Runbooks 16 and 19). If PnP can't connect, the run drops to Graph-only with a note.
+
+.NOTES
+    Auth        : Automation Account system-assigned Managed Identity, no secrets.
+                  Graph via MI token + REST (no Microsoft.Graph module, so PnP loads cleanly).
+    Permissions : Graph Directory.Read.All   (granted) - groups, owners, users, deleted groups
+                  Graph Sites.Read.All       (granted) - group site URLs
+                  Graph Mail.Send            (granted)
+                  OPTIONAL Graph Reports.Read.All (pending) - activity for group sites in
+                           Graph-only mode (PnP mode gets activity from the admin API instead)
+                  OPTIONAL SharePoint Sites.FullControl.All - PnP mode
+    Modules     : PnP.PowerShell 2.12.0 (PnP mode only)
+    Schedule    : quarterly per the maintenance sheet (archive stale/orphaned sites task).
+
+    UNVERIFIED - first test run:
+      1. Redirect target lookup: an unauthenticated request to the redirect URL with
+         -MaximumRedirection 0 is expected to return a 30x with the new URL in Location.
+         If it doesn't, the target shows as "not determined" - the redirect is still listed.
+      2. Per-site Connect-PnPOnline -ManagedIdentity for secondary admins (only done for
+         orphan candidates) - failures are logged, the site stays flagged.
+#>
+
+#region ---------------------------- CONFIG ----------------------------
+$TenantLabel            = 'CrucialLogics'
+$SenderMailbox          = 'm365-audits@cruciallogics.com'
+$Recipients             = @('replace-me@cruciallogics.com')
+
+$UseSharePointAdminApi  = $true
+$TenantAdminUrl         = 'https://contoso-admin.sharepoint.com'
+$CheckSecondaryAdmins   = $true     # PnP mode: per-site check, only for orphan candidates
+
+$InactiveDays           = 180
+$RedirectReviewDays     = 180
+$FlagSingleOwner        = $true
+
+$ExcludeTemplates       = @('SRCHCEN#0','SPSMSITEHOST#0','APPCATALOG#0','POINTPUBLISHINGHUB#0','EDISC#0','SPSPERS#10','TEAMCHANNEL#0','TEAMCHANNEL#1')
+$ExcludeSiteUrlPatterns = @()       # wildcards
+$MaxSecondaryAdminChecks = 200      # cap on per-site connections
+
+$TopRowsInEmail         = 30
+$SendEmail              = $true
+#endregion -------------------------------------------------------------
+
+$ErrorActionPreference = 'Stop'
+
+#region ---------------------------- HELPERS ---------------------------
+function Get-MIToken {
+    param([string]$Resource)
+    if (-not $env:IDENTITY_ENDPOINT -or -not $env:IDENTITY_HEADER) {
+        throw 'IDENTITY_ENDPOINT / IDENTITY_HEADER not set. Run this in Azure Automation with the system-assigned managed identity enabled.'
+    }
+    $uri = "$($env:IDENTITY_ENDPOINT)?resource=$([uri]::EscapeDataString($Resource))&api-version=2019-08-01"
+    (Invoke-RestMethod -Method GET -Uri $uri -Headers @{ 'X-IDENTITY-HEADER' = $env:IDENTITY_HEADER; 'Metadata' = 'True' }).access_token
+}
+function Invoke-Graph { param([string]$Uri) Invoke-RestMethod -Method GET -Uri $Uri -Headers @{ Authorization = "Bearer $script:GraphToken" } }
+function Get-GraphAll {
+    param([string]$Uri)
+    $out = New-Object System.Collections.Generic.List[object]
+    $next = $Uri
+    while ($next) {
+        $resp = Invoke-Graph $next
+        foreach ($v in @($resp.value)) { $out.Add($v) }
+        $next = $resp.'@odata.nextLink'
+    }
+    return $out.ToArray()
+}
+function Get-ReportCsv {
+    param([string]$Function)
+    $path = Join-Path ([System.IO.Path]::GetTempPath()) ("rpt-{0}.csv" -f [guid]::NewGuid())
+    try {
+        Invoke-WebRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/reports/$Function" `
+            -Headers @{ Authorization = "Bearer $script:GraphToken" } -OutFile $path -UseBasicParsing | Out-Null
+        return ,@(Import-Csv -LiteralPath $path)
+    }
+    finally { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue } }
+}
+
+function Send-ReportEmail {
+    param(
+        [Parameter(Mandatory)] [string]   $From,
+        [Parameter(Mandatory)] [string[]] $To,
+        [Parameter(Mandatory)] [string]   $Subject,
+        [Parameter(Mandatory)] [string]   $HtmlBody,
+        [string] $AttachmentPath
+    )
+    $message = @{
+        subject      = $Subject
+        body         = @{ contentType = 'HTML'; content = $HtmlBody }
+        toRecipients = @($To | ForEach-Object { @{ emailAddress = @{ address = $_ } } })
+    }
+    if ($AttachmentPath -and (Test-Path -LiteralPath $AttachmentPath)) {
+        $bytes = [System.IO.File]::ReadAllBytes($AttachmentPath)
+        if ($bytes.Length -gt 3MB) { Write-Warning 'Attachment over 3 MB, sending without it.' }
+        else {
+            $message.attachments = @(@{
+                '@odata.type' = '#microsoft.graph.fileAttachment'
+                name          = [System.IO.Path]::GetFileName($AttachmentPath)
+                contentType   = 'text/csv'
+                contentBytes  = [System.Convert]::ToBase64String($bytes)
+            })
+        }
+    }
+    $payload = @{ message = $message; saveToSentItems = $false } | ConvertTo-Json -Depth 10
+    Invoke-RestMethod -Method POST -Uri "https://graph.microsoft.com/v1.0/users/$From/sendMail" `
+        -Headers @{ Authorization = "Bearer $(Get-MIToken 'https://graph.microsoft.com/')" } -Body $payload -ContentType 'application/json' | Out-Null
+}
+
+function Get-Str { param($Obj, [string]$Name) $p = $Obj.PSObject.Properties[$Name]; if ($p -and $null -ne $p.Value) { "$($p.Value)" } else { '' } }
+function ConvertTo-UtcDate {
+    param($v)
+    if ($null -eq $v -or "$v" -eq '') { return $null }
+    if ($v -is [datetime]) { if ($v.Year -lt 1900) { return $null }; return $v.ToUniversalTime() }
+    $d = [datetime]::MinValue
+    if ([datetime]::TryParse("$v", [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$d)) { if ($d.Year -lt 1900) { return $null }; return $d.ToUniversalTime() }
+    return $null
+}
+function Test-Like { param([string]$v, [string[]]$p) if (-not $v) { return $false }; foreach ($x in $p) { if ($v -like $x) { return $true } }; $false }
+function ConvertTo-HtmlSafe { param([string]$Text) [System.Net.WebUtility]::HtmlEncode($Text) }
+
+# SharePoint login -> what kind of principal it is
+function Resolve-Login {
+    param([string]$Login)
+    if (-not $Login) { return @{ Kind = 'None' } }
+    if ($Login -match 'federateddirectoryclaimprovider\|([0-9a-fA-F-]{36})') { return @{ Kind = 'GroupClaim'; Id = $Matches[1].ToLowerInvariant() } }
+    if ($Login -match '^c:0t\.c\|tenant\|' -or $Login -match '^c:0-\.f\|rolemanager\|') { return @{ Kind = 'SecurityGroup'; Id = $Login } }
+    $upn = if ($Login -match '\|([^|]+@[^|]+)$') { $Matches[1] } elseif ($Login -like '*@*') { $Login } else { '' }
+    if (-not $upn) { return @{ Kind = 'Unknown'; Id = $Login } }
+    $u = $script:UserByKey[$upn.ToLowerInvariant()]
+    if (-not $u) { return @{ Kind = 'DeletedUser'; Id = $upn } }
+    if ($u.userType -eq 'Guest') { return @{ Kind = 'Guest'; Id = $upn; Enabled = [bool]$u.accountEnabled } }
+    return @{ Kind = 'User'; Id = $upn; Enabled = [bool]$u.accountEnabled }
+}
+
+$FindingRank = @{
+    'Orphaned: no owners'                       = 1
+    'Orphaned: all owners disabled/deleted'     = 1
+    'Orphaned: group no longer exists'          = 1
+    'Orphaned: no usable site admin'            = 1
+    'Owned only by guests'                      = 2
+    'Owned only by apps'                        = 2
+    'Redirect target missing'                   = 2
+    'Single owner'                              = 3
+    'Group soft-deleted'                        = 3
+    'Primary admin gone (secondary admin OK)'   = 3
+    'Old redirect - review'                     = 3
+    'Redirect (healthy)'                        = 5
+    'Redirect (target not determined)'          = 5
+}
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- DIRECTORY -------------------------
+$nowUtc      = [datetime]::UtcNow
+$inactiveCut = $nowUtc.AddDays(-$InactiveDays)
+$gaps        = New-Object System.Collections.Generic.List[string]
+$rows        = New-Object System.Collections.Generic.List[object]
+Write-Output "Runbook 22 - Orphaned and redirect site review. $($nowUtc.ToString('yyyy-MM-dd HH:mm')) UTC."
+
+$script:GraphToken = Get-MIToken 'https://graph.microsoft.com/'
+$script:UserByKey = @{}
+foreach ($u in (Get-GraphAll 'https://graph.microsoft.com/v1.0/users?$select=id,userPrincipalName,mail,accountEnabled,userType&$top=999')) {
+    foreach ($k in @($u.userPrincipalName, $u.mail)) { if ($k) { $script:UserByKey["$k".ToLowerInvariant()] = $u } }
+}
+
+# All M365 (Unified) groups with owners expanded - one paged call
+$groups = @(Get-GraphAll 'https://graph.microsoft.com/v1.0/groups?$select=id,displayName,mail,groupTypes,resourceProvisioningOptions,createdDateTime&$expand=owners($select=id,userPrincipalName,accountEnabled,userType)&$top=100' |
+    Where-Object { @($_.groupTypes) -contains 'Unified' })
+$groupById = @{}
+foreach ($g in $groups) { $groupById["$($g.id)".ToLowerInvariant()] = $g }
+$deletedGroupIds = New-Object 'System.Collections.Generic.HashSet[string]'
+try { foreach ($dg in (Get-GraphAll 'https://graph.microsoft.com/v1.0/directory/deletedItems/microsoft.graph.group?$select=id')) { [void]$deletedGroupIds.Add("$($dg.id)".ToLowerInvariant()) } }
+catch { $gaps.Add("Deleted groups not read: $($_.Exception.Message)") }
+Write-Output "Users: $($script:UserByKey.Count) keys. M365 groups: $($groups.Count)."
+
+# Evaluate a group's owners -> findings
+function Get-GroupOwnerFindings {
+    param($Group)
+    $owners = @($Group.owners)
+    $people = @($owners | Where-Object { $_.'@odata.type' -eq '#microsoft.graph.user' -or $_.userPrincipalName })
+    $apps   = @($owners | Where-Object { $_.'@odata.type' -eq '#microsoft.graph.servicePrincipal' })
+    $activeMembers = @($people | Where-Object { $_.accountEnabled -ne $false -and $_.userType -ne 'Guest' })
+    $activeGuests  = @($people | Where-Object { $_.accountEnabled -ne $false -and $_.userType -eq 'Guest' })
+    $f = New-Object System.Collections.Generic.List[string]
+    if ($owners.Count -eq 0)                                  { $f.Add('Orphaned: no owners') }
+    elseif ($activeMembers.Count -eq 0 -and $activeGuests.Count -gt 0) { $f.Add('Owned only by guests') }
+    elseif ($people.Count -eq 0 -and $apps.Count -gt 0)       { $f.Add('Owned only by apps') }
+    elseif ($activeMembers.Count -eq 0)                       { $f.Add('Orphaned: all owners disabled/deleted') }
+    elseif ($FlagSingleOwner -and $activeMembers.Count -eq 1) { $f.Add('Single owner') }
+    $ownerText = (@($people | ForEach-Object { "$($_.userPrincipalName)$(if ($_.accountEnabled -eq $false) { ' (disabled)' })$(if ($_.userType -eq 'Guest') { ' (guest)' })" }) +
+                  @($apps | ForEach-Object { "app:$($_.id)" })) -join '; '
+    return @{ Findings = $f; Owners = $ownerText }
+}
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- SHAREPOINT ADMIN (PnP) ------------
+$pnpOk = $false
+$sites = @()
+if ($UseSharePointAdminApi) {
+    try {
+        Import-Module PnP.PowerShell -RequiredVersion 2.12.0 -ErrorAction Stop
+        Connect-PnPOnline -Url $TenantAdminUrl -ManagedIdentity -ErrorAction Stop
+        $sites = @(Get-PnPTenantSite -ErrorAction Stop | Where-Object {
+            ($ExcludeTemplates -notcontains (Get-Str $_ 'Template')) -and -not (Test-Like (Get-Str $_ 'Url') $ExcludeSiteUrlPatterns)
+        })
+        $pnpOk = $true
+        Write-Output "SharePoint admin API: $($sites.Count) sites in scope."
+    }
+    catch {
+        $gaps.Add("SharePoint admin API unavailable ($($_.Exception.Message)). Ran Graph-only: group-connected sites checked; NON-GROUP sites, sites whose group vanished, and REDIRECT sites were NOT checked. Needs PnP.PowerShell 2.12.0 + SharePoint Sites.FullControl.All.")
+        Write-Warning $gaps[-1]
+    }
+}
+else {
+    $gaps.Add('Graph-only mode ($UseSharePointAdminApi off): non-group sites and redirect sites not checked.')
+}
+
+function Add-SiteRow {
+    param([string]$Title, [string]$Url, [string]$Type, [string]$Owners, [System.Collections.Generic.List[string]]$Findings,
+          $LastActivity, [double]$StorageGB = -1, [string]$Extra = '', [string]$GroupName = '')
+    $names = @($Findings | Select-Object -Unique)
+    if (-not $names.Count) { return }
+    $rank = ($names | ForEach-Object { $FindingRank[$_] } | Measure-Object -Minimum).Minimum
+    $isOrphan = @($names | Where-Object { $_ -like 'Orphaned*' -or $_ -like 'Owned only*' }).Count -gt 0
+    $active   = $LastActivity -and $LastActivity -ge $inactiveCut
+    $action = if ($isOrphan) {
+                  if ($null -eq $LastActivity) { 'Assign an owner, or confirm the site is unused before archiving (activity unknown)' }
+                  elseif ($active) { 'Assign an owner now - site is still in use' }
+                  else { 'Archive (Microsoft 365 Archive) or delete after confirming with the business' }
+              }
+              elseif ($names -contains 'Redirect target missing') { 'Delete the redirect - it points nowhere' }
+              elseif ($names -contains 'Old redirect - review') { 'Check whether old links still hit it; remove only if unused' }
+              elseif ($names -contains 'Single owner') { 'Add a second owner' }
+              elseif ($names -contains 'Primary admin gone (secondary admin OK)') { 'Set a current primary site admin' }
+              elseif ($names -contains 'Group soft-deleted') { 'Restore the group within 30 days if the site is still needed' }
+              else { '' }
+    $rows.Add([pscustomobject][ordered]@{
+        Priority     = $rank
+        Findings     = $names -join '; '
+        Action       = $action
+        Site         = $Title
+        Url          = $Url
+        Type         = $Type
+        Group        = $GroupName
+        Owners       = $Owners
+        LastActivity = if ($LastActivity) { $LastActivity.ToString('yyyy-MM-dd') } else { 'unknown' }
+        StorageGB    = if ($StorageGB -ge 0) { [math]::Round($StorageGB, 2) } else { '' }
+        Details      = $Extra
+    })
+}
+
+$checkedGroupIds = New-Object 'System.Collections.Generic.HashSet[string]'
+$redirectCount = 0
+if ($pnpOk) {
+    $siteUrls = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($s in $sites) { [void]$siteUrls.Add((Get-Str $s 'Url').TrimEnd('/').ToLowerInvariant()) }
+    $adminChecks = 0
+
+    foreach ($s in $sites) {
+        $url      = Get-Str $s 'Url'
+        $title    = Get-Str $s 'Title'
+        $template = Get-Str $s 'Template'
+        $last     = ConvertTo-UtcDate $s.LastContentModifiedDate
+        $mb       = 0.0; [void][double]::TryParse((Get-Str $s 'StorageUsageCurrent'), [ref]$mb)
+        $gb       = $mb / 1024
+        $gid      = (Get-Str $s 'GroupId').ToLowerInvariant()
+        $hasGroup = $gid -and $gid -ne '00000000-0000-0000-0000-000000000000'
+        $f        = New-Object System.Collections.Generic.List[string]
+
+        # ---- Redirect sites ----
+        if ($template -like 'REDIRECTSITE#*') {
+            $redirectCount++
+            $target = ''
+            try {
+                $r = Invoke-WebRequest -Uri $url -MaximumRedirection 0 -SkipHttpErrorCheck -UseBasicParsing -ErrorAction Stop
+                $loc = "$(@($r.Headers['Location'])[0])"
+                # Only a SharePoint URL counts as the redirect target - a bounce to the sign-in page is not
+                if ($loc -match '^https://[^/]+\.sharepoint\.(com|us|de|cn)/' -and $loc -notmatch '(?i)/_layouts/15/(Authenticate|AccessDenied)') { $target = $loc }
+            } catch { }
+            $changed = ConvertTo-UtcDate $s.LastContentModifiedDate   # bulk list has no creation date - last change is the proxy
+            $ageDays = if ($changed) { [int]($nowUtc - $changed).TotalDays } else { $null }
+            if ($target) {
+                $tUrl = ($target -split '\?')[0].TrimEnd('/').ToLowerInvariant()
+                $tSite = @($siteUrls | Where-Object { $tUrl -eq $_ -or $tUrl.StartsWith("$_/") }) | Select-Object -First 1
+                if (-not $tSite) { $f.Add('Redirect target missing') }
+            }
+            if ($ageDays -ne $null -and $ageDays -gt $RedirectReviewDays) { $f.Add('Old redirect - review') }
+            if ($f.Count -eq 0) { $f.Add($(if ($target) { 'Redirect (healthy)' } else { 'Redirect (target not determined)' })) }
+            if (-not $title) { $title = "(redirect) $(($url.TrimEnd('/') -split '/')[-1])" }
+            Add-SiteRow -Title $title -Url $url -Type 'Redirect' -Owners '' -Findings $f -LastActivity $null `
+                -Extra "Target: $(if ($target) { $target } else { 'not determined' }); unchanged for $(if ($ageDays -ne $null) { "$ageDays days" } else { 'unknown' })"
+            continue
+        }
+
+        # ---- Group-connected sites ----
+        if ($hasGroup) {
+            [void]$checkedGroupIds.Add($gid)
+            if ($groupById.ContainsKey($gid)) {
+                $g = $groupById[$gid]
+                $o = Get-GroupOwnerFindings $g
+                foreach ($x in $o.Findings) { $f.Add($x) }
+                $type = if (@($g.resourceProvisioningOptions) -contains 'Team') { 'Team site' } else { 'M365 group site' }
+                Add-SiteRow -Title $title -Url $url -Type $type -Owners $o.Owners -Findings $f -LastActivity $last -StorageGB $gb -GroupName $g.displayName
+            }
+            elseif ($deletedGroupIds.Contains($gid)) {
+                $f.Add('Group soft-deleted')
+                Add-SiteRow -Title $title -Url $url -Type 'M365 group site' -Owners '' -Findings $f -LastActivity $last -StorageGB $gb -Extra "GroupId $gid"
+            }
+            else {
+                $f.Add('Orphaned: group no longer exists')
+                Add-SiteRow -Title $title -Url $url -Type 'M365 group site' -Owners '' -Findings $f -LastActivity $last -StorageGB $gb -Extra "GroupId $gid not found in the directory"
+            }
+            continue
+        }
+
+        # ---- Non-group sites: primary admin, then secondary admins for candidates ----
+        $primary = Resolve-Login (Get-Str $s 'Owner')
+        $primaryOk = ($primary.Kind -eq 'User' -and $primary.Enabled) -or $primary.Kind -in 'SecurityGroup','GroupClaim'
+        if ($primaryOk) { continue }
+
+        $secondaryOk = $false; $admins = @()
+        if ($CheckSecondaryAdmins -and $adminChecks -lt $MaxSecondaryAdminChecks) {
+            $adminChecks++
+            try {
+                $conn = Connect-PnPOnline -Url $url -ManagedIdentity -ReturnConnection -ErrorAction Stop
+                $admins = @(Get-PnPSiteCollectionAdmin -Connection $conn -ErrorAction Stop)
+                foreach ($a in $admins) {
+                    $ra = Resolve-Login (Get-Str $a 'LoginName')
+                    if (($ra.Kind -eq 'User' -and $ra.Enabled) -or $ra.Kind -in 'SecurityGroup','GroupClaim') { $secondaryOk = $true; break }
+                }
+            }
+            catch { $gaps.Add("Secondary admins not read for $url : $($_.Exception.Message)") }
+        }
+        elseif ($CheckSecondaryAdmins) { if (-not ($gaps -match 'secondary-admin cap')) { $gaps.Add("Hit the secondary-admin cap ($MaxSecondaryAdminChecks); remaining candidates flagged on primary admin only.") } }
+
+        if ($secondaryOk) { $f.Add('Primary admin gone (secondary admin OK)') }
+        else { $f.Add('Orphaned: no usable site admin') }
+        $ownerText = "Primary: $(Get-Str $s 'Owner') [$($primary.Kind)$(if ($primary.Kind -eq 'User' -and -not $primary.Enabled) { ', disabled' })]"
+        if ($admins.Count) { $ownerText += "; Admins: $((@($admins | ForEach-Object { Get-Str $_ 'Email' }) | Where-Object { $_ }) -join ', ')" }
+        Add-SiteRow -Title $title -Url $url -Type "Non-group ($template)" -Owners $ownerText -Findings $f -LastActivity $last -StorageGB $gb
+    }
+    Disconnect-PnPOnline -ErrorAction SilentlyContinue
+}
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- GRAPH-ONLY GROUP SITES ------------
+# Groups not already evaluated through PnP (all of them in Graph-only mode)
+$activityById = @{}
+$remaining = @($groups | Where-Object { -not $checkedGroupIds.Contains("$($_.id)".ToLowerInvariant()) })
+if ($remaining.Count) {
+    try {
+        foreach ($r in (Get-ReportCsv "getSharePointSiteUsageDetail(period='D180')")) {
+            $sid = "$($r.'Site Id')".ToLowerInvariant()
+            if ($sid) { $activityById[$sid] = @{ Last = ConvertTo-UtcDate $r.'Last Activity Date'; GB = ([double]("0$($r.'Storage Used (Byte)')")) / 1GB } }
+        }
+    }
+    catch { $gaps.Add('Site activity unavailable for Graph-only group checks (Reports.Read.All pending) - orphan actions say "activity unknown".') }
+}
+foreach ($g in $remaining) {
+    $o = Get-GroupOwnerFindings $g
+    if (-not $o.Findings.Count) { continue }
+    $url = ''; $title = $g.displayName; $sid = ''
+    try {
+        $site = Invoke-Graph "https://graph.microsoft.com/v1.0/groups/$($g.id)/sites/root?`$select=id,webUrl,displayName"
+        $url = $site.webUrl; $sid = ("$($site.id)" -split ',')[1]
+    }
+    catch { $url = '(no site provisioned or not reachable)' }
+    $act = if ($sid -and $activityById.ContainsKey("$sid".ToLowerInvariant())) { $activityById["$sid".ToLowerInvariant()] } else { $null }
+    $type = if (@($g.resourceProvisioningOptions) -contains 'Team') { 'Team site' } else { 'M365 group site' }
+    Add-SiteRow -Title $title -Url $url -Type $type -Owners $o.Owners -Findings $o.Findings `
+        -LastActivity $(if ($act) { $act.Last } else { $null }) -StorageGB $(if ($act) { $act.GB } else { -1 }) -GroupName $g.displayName
+}
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- OUTPUT ----------------------------
+$final = @($rows | Sort-Object Priority, @{ Expression = 'StorageGB'; Descending = $true }, Url)
+$stamp = $nowUtc.ToString('yyyyMMdd-HHmm')
+$csvPath = Join-Path ([System.IO.Path]::GetTempPath()) "OrphanRedirectSites-$stamp.csv"
+if ($final.Count) { $final | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding utf8 }
+
+$orphans   = @($final | Where-Object { $_.Findings -match 'Orphaned|Owned only' })
+$orphActive = @($orphans | Where-Object { $_.Action -like 'Assign an owner now*' }).Count
+$orphIdle   = @($orphans | Where-Object { $_.Action -like 'Archive*' }).Count
+$single    = @($final | Where-Object { $_.Findings -match 'Single owner' }).Count
+$redirects = @($final | Where-Object Type -eq 'Redirect')
+$broken    = @($redirects | Where-Object { $_.Findings -match 'target missing' }).Count
+$oldRed    = @($redirects | Where-Object { $_.Findings -match 'Old redirect' }).Count
+$findingCnt = @($final | ForEach-Object { $_.Findings -split '; ' } | Group-Object | Sort-Object { $FindingRank[$_.Name] }, Name)
+
+$th  = 'style="background:#f0f0f0;text-align:left;padding:5px;border:1px solid #ccc"'
+$td  = 'style="padding:5px;border:1px solid #ccc;vertical-align:top"'
+$tdr = 'style="padding:5px;border:1px solid #ccc;text-align:right"'
+$red = 'padding:5px;border:1px solid #ccc;color:#b00020;font-weight:600'
+
+$sb = New-Object System.Text.StringBuilder
+[void]$sb.Append('<html><body style="font-family:Segoe UI,Arial,sans-serif;font-size:13px;color:#222">')
+[void]$sb.Append("<h2 style='margin-bottom:4px'>Orphaned &amp; redirect site review - $(ConvertTo-HtmlSafe $TenantLabel)</h2>")
+[void]$sb.Append("<p style='margin-top:0;color:#555'>Mode: $(if ($pnpOk) { 'SharePoint admin API + Graph (all sites)' } else { 'Graph only (group-connected sites)' }). Read-only. Full list in the attached CSV.</p>")
+if ($gaps.Count) {
+    [void]$sb.Append('<div style="background:#fff4e5;border-left:4px solid #e08a00;padding:8px 12px;margin:10px 0"><b>Data gaps:</b><ul style="margin:4px 0">')
+    foreach ($g in ($gaps | Select-Object -First 10)) { [void]$sb.Append("<li>$(ConvertTo-HtmlSafe $g)</li>") }
+    if ($gaps.Count -gt 10) { [void]$sb.Append("<li>... and $($gaps.Count - 10) more in the job log</li>") }
+    [void]$sb.Append('</ul></div>')
+}
+[void]$sb.Append("<h3>Summary</h3><table style='border-collapse:collapse'>")
+[void]$sb.Append("<tr><td $td>Orphaned sites</td><td style='$red;text-align:right'>$($orphans.Count)</td></tr>")
+[void]$sb.Append("<tr><td $td>&nbsp;&nbsp;still in use - assign owner now</td><td $tdr>$orphActive</td></tr>")
+[void]$sb.Append("<tr><td $td>&nbsp;&nbsp;inactive $InactiveDays+ days - archive/delete candidates</td><td $tdr>$orphIdle</td></tr>")
+[void]$sb.Append("<tr><td $td>Single-owner group sites</td><td $tdr>$single</td></tr>")
+if ($pnpOk) {
+    [void]$sb.Append("<tr><td $td>Redirect sites</td><td $tdr>$redirectCount</td></tr>")
+    [void]$sb.Append("<tr><td $td>&nbsp;&nbsp;broken (target missing)</td><td $tdr>$broken</td></tr>")
+    [void]$sb.Append("<tr><td $td>&nbsp;&nbsp;older than $RedirectReviewDays days</td><td $tdr>$oldRed</td></tr>")
+}
+[void]$sb.Append('</table>')
+
+$top = @($final | Where-Object { $_.Priority -le 3 } | Select-Object -First $TopRowsInEmail)
+if ($top.Count) {
+    [void]$sb.Append("<h3>Work queue (most urgent first)</h3><table style='border-collapse:collapse'><tr><th $th>Site</th><th $th>Type</th><th $th>Findings</th><th $th>Last activity</th><th $th>Action</th></tr>")
+    foreach ($r in $top) {
+        $style = if ($r.Priority -eq 1) { $red } else { 'padding:5px;border:1px solid #ccc;vertical-align:top' }
+        $label = if ($r.Site) { $r.Site } else { $r.Url }
+        $link = if ($r.Url -like 'https://*') { "<a href='$($r.Url)'>$(ConvertTo-HtmlSafe $label)</a>" } else { ConvertTo-HtmlSafe $label }
+        [void]$sb.Append("<tr><td $td>$link</td><td $td>$(ConvertTo-HtmlSafe $r.Type)</td><td style='$style'>$(ConvertTo-HtmlSafe $r.Findings)</td><td $td>$($r.LastActivity)</td><td $td>$(ConvertTo-HtmlSafe $r.Action)</td></tr>")
+    }
+    [void]$sb.Append('</table>')
+}
+else { [void]$sb.Append('<p><b>No orphaned sites or redirect issues found.</b></p>') }
+[void]$sb.Append("<p style='color:#888;font-size:11px'>Generated by Runbook 22 (22-Review-OrphanAndRedirectSites.ps1), Azure Automation, managed identity. Redirect sites are created by site URL changes; deleting one breaks any old link that still points at it.</p></body></html>")
+$html = $sb.ToString()
+
+Write-Output "Rows: $($final.Count). Orphaned: $($orphans.Count) (active $orphActive, idle $orphIdle). Single owner: $single. Redirects: $redirectCount (broken $broken, old $oldRed)."
+foreach ($f in $findingCnt) { Write-Output ("  {0,-42} {1}" -f $f.Name, $f.Count) }
+foreach ($g in $gaps) { Write-Output "  DATA GAP: $g" }
+
+if ($SendEmail) {
+    $flag = if ($orphans.Count) { "[$($orphans.Count) orphaned] " } else { '' }
+    try {
+        Send-ReportEmail -From $SenderMailbox -To $Recipients -Subject "${flag}Orphaned & redirect site review - $TenantLabel - $($nowUtc.ToString('yyyy-MM-dd'))" `
+            -HtmlBody $html -AttachmentPath $(if ($final.Count) { $csvPath } else { $null })
+        Write-Output "Report emailed to $($Recipients -join ', ')."
+    }
+    catch { Write-Error "sendMail failed from $SenderMailbox. $($_.Exception.Message)"; throw }
+    Remove-Item -LiteralPath $csvPath -Force -ErrorAction SilentlyContinue
+}
+else { Write-Output "SendEmail is off. CSV written to $csvPath." }
+#endregion -------------------------------------------------------------

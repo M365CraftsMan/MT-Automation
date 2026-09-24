@@ -1,0 +1,736 @@
+<#
+.SYNOPSIS
+    Runbook 14 - Microsoft 365 licensing optimization review (quarterly).
+
+.DESCRIPTION
+    Read-only. Finds licence spend that can be reclaimed, reassigned, or trued-down
+    at renewal, and emails a risk-ranked CSV + HTML summary built for the client MOR.
+    Nothing is removed or changed; every finding is a recommendation for a human.
+
+    SKU-level checks (RowType = SKU / Subscription)
+      - Units in warning (grace) or suspended state, or more assigned than purchased
+      - Unassigned paid licences sitting idle
+      - Subscriptions renewing / changing lifecycle within $RenewalWindowDays
+        (the true-down decision window)
+      - Per SKU: purchased, assigned, available, reclaimable-from-users, potential
+        free units, and (if $SkuMonthlyCost is filled in) estimated monthly saving
+
+    User-level checks (RowType = User), licensed users only
+      - Licence assignment in Error state (e.g. CountViolation, MutuallyExclusiveViolation)
+      - Disabled account still holding licences
+      - Inactive: no sign-in (interactive or non-interactive) for $InactiveDays AND no
+        workload activity for $InactiveDays in the usage report (when available)
+      - Never signed in, created more than $NewUserGraceDays ago
+      - Shared mailbox holding a licence (from the mailbox usage report); split into
+        "likely reclaimable" (<50 GB, no archive) vs "licence likely required"
+      - Overlapping SKUs (e.g. Microsoft 365 E5 + Office 365 E3 on the same user),
+        driven by the editable $OverlapRules table
+      - Guest (B2B) accounts holding licences
+      - Downgrade candidate: holds a SKU that includes desktop Office apps but has
+        never activated them on Windows or Mac (web/mobile only)
+
+    Each licence shows how it was assigned (Direct / Group: <name>). Group-assigned
+    licences must be reclaimed by removing the user from the group, not by removing
+    the licence directly.
+
+.NOTES
+    Auth        : Automation Account system-assigned Managed Identity
+                  (Connect-MgGraph -Identity). No secrets, no certificates.
+    Admin role  : none. Graph application permissions only.
+    Graph perms : Directory.Read.All      (granted)  users, licences, subscribedSkus,
+                                                     directory/subscriptions, group names
+                  AuditLog.Read.All       (granted)  signInActivity (needs Entra ID P1+)
+                  Reports.Read.All        (PENDING - also blocking the mailbox usage runbook)
+                  Mail.Send               (granted)
+                  If subscribedSkus or directory/subscriptions return 403, add
+                  LicenseAssignment.Read.All (narrow, read-only) to the CR addendum.
+    Modules     : Microsoft.Graph.Authentication only. No PnP, no version floor.
+    Schedule    : Automation Account schedule, Recurrence = Monthly, Recur every 3 months,
+                  pick a day ~6 weeks before the client's main renewal if possible.
+
+    Degrades gracefully and says so in the email's "Data gaps" section:
+      - No Reports.Read.All       -> no workload activity, shared mailbox, or desktop-app checks
+      - Reports concealed         -> same (usernames are hashed, can't be joined). Fix once in
+                                     M365 admin center > Settings > Org settings > Reports >
+                                     untick "Display concealed user, group, and site names".
+      - No Entra ID P1 / signInActivity unavailable -> inactivity uses workload activity only
+
+    Send-ReportEmail is inlined (no $PSScriptRoot dot-source) so this works when pasted into
+    the Automation Account editor. Swap in the canonical body from "Automation on MT.zip"
+    if it differs.
+#>
+
+#region ---------------------------- CONFIG ----------------------------
+$TenantLabel         = 'CrucialLogics'                    # appears in the email subject
+$SenderMailbox       = 'm365-audits@cruciallogics.com'
+$Recipients          = @('replace-me@cruciallogics.com')
+
+$InactiveDays        = 90    # no sign-in AND no workload activity for this long = reclaim candidate
+$NewUserGraceDays    = 30    # never-signed-in accounts younger than this are ignored (onboarding)
+$RenewalWindowDays   = 120   # subscriptions with a lifecycle date inside this window get flagged
+$UsageReportPeriod   = 'D180'  # D7 | D30 | D90 | D180 - use D180 so it covers $InactiveDays
+
+# Accounts that must never be flagged (break-glass, service, room accounts you license on purpose).
+# Still counted in SKU totals.
+$ExcludeUpns         = @()                                 # exact, case-insensitive
+$ExcludeUpnPatterns  = @()                                 # wildcards, e.g. 'svc-*@contoso.com'
+
+# Free / viral / self-service SKUs - never flagged as "unassigned". SKUs with 10,000+ units
+# or that don't apply to users are skipped automatically as well.
+$IgnoreSkuPartNumbers = @(
+    'FLOW_FREE','POWER_BI_STANDARD','TEAMS_EXPLORATORY','WINDOWS_STORE','STREAM',
+    'POWERAPPS_VIRAL','POWERAPPS_DEV','CCIBOTS_PRIVPREV_VIRAL','MCOPSTNC',
+    'RIGHTSMANAGEMENT_ADHOC','POWERAUTOMATE_ATTENDED_RPA_VIRAL','Microsoft_Teams_Exploratory_Dept'
+)
+
+# Optional: monthly cost per licence, keyed by skuPartNumber, in the client's currency.
+# Leave empty to skip savings estimates. Use the client's actual agreement price, not list.
+$SkuMonthlyCost      = @{
+    # 'SPE_E3'        = 36.00
+    # 'SPE_E5'        = 57.00
+    # 'ENTERPRISEPACK'= 23.00
+}
+$CurrencyLabel       = 'USD'
+
+# SKUs that include desktop Office apps. Holders with no Windows/Mac activation = downgrade candidates.
+$DesktopAppSkus      = @('SPE_E3','SPE_E5','ENTERPRISEPACK','ENTERPRISEPREMIUM','SPB',
+                         'O365_BUSINESS_PREMIUM','O365_BUSINESS','OFFICESUBSCRIPTION')
+
+# Overlap rules: if a user holds the key SKU, the listed SKUs are likely redundant.
+# "Likely" - always verify service plans (e.g. Teams add-ons, no-Teams SKUs) before removing.
+$OverlapRules        = @{
+    'SPE_E5'            = @('SPE_E3','ENTERPRISEPREMIUM','ENTERPRISEPACK','STANDARDPACK','EMS','EMSPREMIUM',
+                            'EXCHANGESTANDARD','EXCHANGEENTERPRISE','O365_BUSINESS_ESSENTIALS',
+                            'O365_BUSINESS_PREMIUM','OFFICESUBSCRIPTION','AAD_PREMIUM','AAD_PREMIUM_P2',
+                            'INTUNE_A','ATP_ENTERPRISE','THREAT_INTELLIGENCE')
+    'SPE_E3'            = @('ENTERPRISEPACK','STANDARDPACK','EMS','EXCHANGESTANDARD','EXCHANGEENTERPRISE',
+                            'O365_BUSINESS_ESSENTIALS','O365_BUSINESS_PREMIUM','OFFICESUBSCRIPTION',
+                            'AAD_PREMIUM','INTUNE_A')
+    'ENTERPRISEPREMIUM' = @('ENTERPRISEPACK','STANDARDPACK','EXCHANGESTANDARD','EXCHANGEENTERPRISE',
+                            'OFFICESUBSCRIPTION','O365_BUSINESS_ESSENTIALS','O365_BUSINESS_PREMIUM',
+                            'ATP_ENTERPRISE','THREAT_INTELLIGENCE')
+    'ENTERPRISEPACK'    = @('STANDARDPACK','EXCHANGESTANDARD','EXCHANGEENTERPRISE','OFFICESUBSCRIPTION',
+                            'O365_BUSINESS_ESSENTIALS','O365_BUSINESS_PREMIUM')
+    'SPB'               = @('O365_BUSINESS_PREMIUM','O365_BUSINESS_ESSENTIALS','O365_BUSINESS',
+                            'EXCHANGESTANDARD','AAD_PREMIUM','INTUNE_A','ATP_ENTERPRISE')
+    'O365_BUSINESS_PREMIUM' = @('O365_BUSINESS_ESSENTIALS','O365_BUSINESS','EXCHANGESTANDARD')
+    'EMSPREMIUM'        = @('EMS','AAD_PREMIUM','AAD_PREMIUM_P2','INTUNE_A')
+    'EMS'               = @('AAD_PREMIUM','INTUNE_A')
+}
+
+$UseFriendlySkuNames = $true   # download Microsoft's published SKU name CSV; falls back to part numbers
+$FriendlySkuCsvUrl   = 'https://download.microsoft.com/download/e/3/e/e3e9faf2-f28b-490a-9ada-c6089a1fc5b0/Product%20names%20and%20service%20plan%20identifiers%20for%20licensing.csv'
+
+$MaxUsersToProcess   = 0       # 0 = all. Set small (e.g. 200) for the first timed test run.
+$TopCandidatesInEmail = 25
+$SendEmail           = $true   # $false = keep the CSV in temp and print the summary to the job log
+#endregion -------------------------------------------------------------
+
+$ErrorActionPreference = 'Stop'
+
+#region ---------------------------- HELPERS ---------------------------
+function Send-ReportEmail {
+    param(
+        [Parameter(Mandatory)] [string]   $From,
+        [Parameter(Mandatory)] [string[]] $To,
+        [Parameter(Mandatory)] [string]   $Subject,
+        [Parameter(Mandatory)] [string]   $HtmlBody,
+        [string] $AttachmentPath
+    )
+    $message = @{
+        subject      = $Subject
+        body         = @{ contentType = 'HTML'; content = $HtmlBody }
+        toRecipients = @($To | ForEach-Object { @{ emailAddress = @{ address = $_ } } })
+    }
+    if ($AttachmentPath -and (Test-Path -LiteralPath $AttachmentPath)) {
+        $bytes = [System.IO.File]::ReadAllBytes($AttachmentPath)
+        if ($bytes.Length -gt 3MB) {
+            Write-Warning "Attachment is $([math]::Round($bytes.Length / 1MB, 2)) MB, over the 3 MB sendMail limit. Sending without it."
+        }
+        else {
+            $message.attachments = @(@{
+                '@odata.type' = '#microsoft.graph.fileAttachment'
+                name          = [System.IO.Path]::GetFileName($AttachmentPath)
+                contentType   = 'text/csv'
+                contentBytes  = [System.Convert]::ToBase64String($bytes)
+            })
+        }
+    }
+    $payload = @{ message = $message; saveToSentItems = $false } | ConvertTo-Json -Depth 10
+    Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/users/$From/sendMail" `
+        -Body $payload -ContentType 'application/json' | Out-Null
+}
+
+function ConvertTo-UtcDate {
+    param($Value)
+    if ($null -eq $Value -or "$Value" -eq '') { return $null }
+    if ($Value -is [datetime])       { return $Value.ToUniversalTime() }
+    if ($Value -is [datetimeoffset]) { return $Value.UtcDateTime }
+    $parsed = [datetimeoffset]::MinValue
+    if ([datetimeoffset]::TryParse([string]$Value, [cultureinfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) {
+        return $parsed.UtcDateTime
+    }
+    return $null
+}
+
+function Get-LatestDate {
+    param([object[]]$Values)
+    $dates = @($Values | ForEach-Object { ConvertTo-UtcDate $_ } | Where-Object { $_ })
+    if ($dates.Count -eq 0) { return $null }
+    return ($dates | Sort-Object -Descending | Select-Object -First 1)
+}
+
+function Get-GraphPaged {
+    param([string]$Uri, [hashtable]$Headers = @{})
+    $items = New-Object System.Collections.Generic.List[object]
+    $next = $Uri
+    while ($next) {
+        $resp = Invoke-MgGraphRequest -Method GET -Uri $next -Headers $Headers -OutputType PSObject
+        foreach ($i in @($resp.value)) { $items.Add($i) }
+        $next = $resp.'@odata.nextLink'
+    }
+    return $items.ToArray()
+}
+
+# Usage report endpoints redirect to a CSV download. Returns $null if unavailable.
+function Get-GraphReportCsv {
+    param([string]$Function)
+    $path = Join-Path ([System.IO.Path]::GetTempPath()) ("rpt-{0}.csv" -f [guid]::NewGuid())
+    try {
+        Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/reports/$Function" -OutputFilePath $path
+        return ,@(Import-Csv -LiteralPath $path)
+    }
+    catch {
+        Write-Warning "Usage report '$Function' unavailable: $($_.Exception.Message)"
+        return $null
+    }
+    finally {
+        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Get-CsvValue {
+    param($Row, [string]$Column)
+    $p = $Row.PSObject.Properties[$Column]
+    if ($p) { return [string]$p.Value } else { return $null }
+}
+
+function Test-ReportConcealed {
+    param([object[]]$Rows)
+    $upns = @($Rows | ForEach-Object { Get-CsvValue $_ 'User Principal Name' } | Where-Object { $_ })
+    if ($upns.Count -eq 0) { return $false }
+    return (@($upns | Where-Object { $_ -like '*@*' }).Count -eq 0)
+}
+
+function Test-Excluded {
+    param([string]$Upn)
+    if (-not $Upn) { return $false }
+    if ($ExcludeUpns | Where-Object { $_ -ieq $Upn }) { return $true }
+    foreach ($p in $ExcludeUpnPatterns) { if ($Upn -like $p) { return $true } }
+    return $false
+}
+
+function ConvertTo-HtmlSafe { param([string]$Text) [System.Net.WebUtility]::HtmlEncode($Text) }
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- COLLECT ---------------------------
+$nowUtc      = [datetime]::UtcNow
+$inactiveCut = $nowUtc.AddDays(-$InactiveDays)
+$graceCut    = $nowUtc.AddDays(-$NewUserGraceDays)
+$dataGaps    = New-Object System.Collections.Generic.List[string]
+
+Write-Output "Runbook 14 - Licensing optimization review. Run time $($nowUtc.ToString('yyyy-MM-dd HH:mm')) UTC."
+
+try { Connect-MgGraph -Identity -NoWelcome }
+catch { Write-Error "Connect-MgGraph -Identity failed: $($_.Exception.Message)"; throw }
+
+# ---- Friendly SKU names (optional) ----
+$friendlyById = @{}
+if ($UseFriendlySkuNames) {
+    try {
+        $csvText = (Invoke-WebRequest -Uri $FriendlySkuCsvUrl -UseBasicParsing -TimeoutSec 60).Content
+        if ($csvText -is [byte[]]) { $csvText = [System.Text.Encoding]::UTF8.GetString($csvText) }
+        foreach ($r in ($csvText | ConvertFrom-Csv)) {
+            $g = "$($r.GUID)".ToLowerInvariant()
+            if ($g -and -not $friendlyById.ContainsKey($g)) { $friendlyById[$g] = $r.Product_Display_Name }
+        }
+        Write-Output "Loaded $($friendlyById.Count) friendly SKU names."
+    }
+    catch {
+        Write-Warning "Friendly SKU name list not loaded, using part numbers: $($_.Exception.Message)"
+    }
+}
+
+# ---- SKUs ----
+try {
+    $skus = Get-GraphPaged -Uri 'https://graph.microsoft.com/v1.0/subscribedSkus'
+}
+catch {
+    Write-Error "Failed to read subscribedSkus. A 403 means add LicenseAssignment.Read.All to the MI. $($_.Exception.Message)"
+    throw
+}
+$skuById = @{}
+foreach ($s in $skus) {
+    $id = "$($s.skuId)".ToLowerInvariant()
+    $name = if ($friendlyById.ContainsKey($id)) { $friendlyById[$id] } else { $s.skuPartNumber }
+    $skuById[$id] = [pscustomobject]@{
+        SkuId        = $id
+        PartNumber   = [string]$s.skuPartNumber
+        Name         = $name
+        AppliesTo    = [string]$s.appliesTo
+        Enabled      = [int]$s.prepaidUnits.enabled
+        Warning      = [int]$s.prepaidUnits.warning
+        Suspended    = [int]$s.prepaidUnits.suspended
+        Consumed     = [int]$s.consumedUnits
+    }
+}
+Write-Output "Retrieved $($skuById.Count) subscribed SKUs."
+
+function Get-SkuLabel { param([string]$SkuId)
+    $k = "$SkuId".ToLowerInvariant()
+    if ($skuById.ContainsKey($k)) { return $skuById[$k].Name } else { return $SkuId }
+}
+function Get-SkuPart { param([string]$SkuId)
+    $k = "$SkuId".ToLowerInvariant()
+    if ($skuById.ContainsKey($k)) { return $skuById[$k].PartNumber } else { return '' }
+}
+
+# ---- Subscriptions (renewal / lifecycle dates) ----
+$subscriptions = @()
+try {
+    $subscriptions = @(Get-GraphPaged -Uri 'https://graph.microsoft.com/v1.0/directory/subscriptions')
+}
+catch {
+    $dataGaps.Add("Subscription lifecycle dates unavailable ($($_.Exception.Message)). Renewal check skipped; add LicenseAssignment.Read.All if this is a 403.")
+    Write-Warning $dataGaps[-1]
+}
+
+# ---- Users (with sign-in activity if the tenant supports it) ----
+$baseSelect = 'id,userPrincipalName,displayName,accountEnabled,userType,createdDateTime,department,assignedLicenses,licenseAssignmentStates'
+$signInAvailable = $true
+try {
+    $users = Get-GraphPaged -Uri "https://graph.microsoft.com/v1.0/users?`$select=$baseSelect,signInActivity&`$top=120"
+}
+catch {
+    $signInAvailable = $false
+    $dataGaps.Add("signInActivity unavailable ($($_.Exception.Message)). Needs AuditLog.Read.All and Entra ID P1+. Inactivity is based on workload activity only.")
+    Write-Warning $dataGaps[-1]
+    $users = Get-GraphPaged -Uri "https://graph.microsoft.com/v1.0/users?`$select=$baseSelect&`$top=999"
+}
+$licensedUsers = @($users | Where-Object { @($_.assignedLicenses).Count -gt 0 })
+if ($MaxUsersToProcess -gt 0 -and $licensedUsers.Count -gt $MaxUsersToProcess) {
+    $dataGaps.Add("TEST MODE: only the first $MaxUsersToProcess of $($licensedUsers.Count) licensed users were processed. Reclaim totals are partial.")
+    $licensedUsers = @($licensedUsers | Select-Object -First $MaxUsersToProcess)
+}
+Write-Output "Retrieved $($users.Count) users, $($licensedUsers.Count) licensed in scope."
+
+# ---- Group names for group-based licensing ----
+$groupNames = @{}
+$groupIds = @($licensedUsers | ForEach-Object { $_.licenseAssignmentStates } |
+    Where-Object { $_.assignedByGroup } | ForEach-Object { "$($_.assignedByGroup)" } | Sort-Object -Unique)
+for ($i = 0; $i -lt $groupIds.Count; $i += 1000) {
+    $chunk = @($groupIds[$i..([math]::Min($i + 999, $groupIds.Count - 1))])
+    try {
+        $body = @{ ids = $chunk; types = @('group') } | ConvertTo-Json -Depth 3
+        $resp = Invoke-MgGraphRequest -Method POST -Uri 'https://graph.microsoft.com/v1.0/directoryObjects/getByIds' `
+            -Body $body -ContentType 'application/json' -OutputType PSObject
+        foreach ($g in @($resp.value)) { $groupNames["$($g.id)".ToLowerInvariant()] = $g.displayName }
+    }
+    catch { Write-Warning "Group name lookup failed for a batch: $($_.Exception.Message)" }
+}
+
+# ---- Usage reports (need Reports.Read.All and un-concealed reports) ----
+$activityByUpn   = @{}
+$activationByUpn = @{}
+$mailboxByUpn    = @{}
+$usageAvailable  = $false
+
+$activeRpt = Get-GraphReportCsv -Function "getOffice365ActiveUserDetail(period='$UsageReportPeriod')"
+if ($null -eq $activeRpt) {
+    $dataGaps.Add('Usage reports unavailable (Reports.Read.All not granted or not yet propagated). Workload activity, shared mailbox and downgrade checks skipped.')
+}
+elseif (Test-ReportConcealed $activeRpt) {
+    $dataGaps.Add('Usage reports are concealed (usernames hashed), so they cannot be matched to users. Untick "Display concealed user, group, and site names" in M365 admin center > Settings > Org settings > Reports.')
+}
+else {
+    $usageAvailable = $true
+    $activityCols = @('Exchange Last Activity Date','OneDrive Last Activity Date','SharePoint Last Activity Date',
+                      'Skype For Business Last Activity Date','Yammer Last Activity Date','Teams Last Activity Date')
+    foreach ($r in $activeRpt) {
+        $upn = (Get-CsvValue $r 'User Principal Name')
+        if (-not $upn) { continue }
+        $activityByUpn[$upn.ToLowerInvariant()] = Get-LatestDate @($activityCols | ForEach-Object { Get-CsvValue $r $_ })
+    }
+
+    $actRpt = Get-GraphReportCsv -Function 'getOffice365ActivationsUserDetail'
+    if ($actRpt) {
+        foreach ($r in $actRpt) {
+            $upn = (Get-CsvValue $r 'User Principal Name')
+            if (-not $upn) { continue }
+            $key = $upn.ToLowerInvariant()
+            $win = 0; $mac = 0
+            [void][int]::TryParse((Get-CsvValue $r 'Windows'), [ref]$win)
+            [void][int]::TryParse((Get-CsvValue $r 'Mac'), [ref]$mac)
+            if (-not $activationByUpn.ContainsKey($key)) { $activationByUpn[$key] = 0 }
+            $activationByUpn[$key] += ($win + $mac)
+        }
+    }
+    else { $dataGaps.Add('Office activations report unavailable. Downgrade check skipped.') }
+
+    $mbxRpt = Get-GraphReportCsv -Function "getMailboxUsageDetail(period='$UsageReportPeriod')"
+    if ($mbxRpt -and $mbxRpt.Count -gt 0 -and $mbxRpt[0].PSObject.Properties['Recipient Type']) {
+        foreach ($r in $mbxRpt) {
+            $upn = (Get-CsvValue $r 'User Principal Name')
+            if (-not $upn) { continue }
+            $bytes = [double]0
+            [void][double]::TryParse((Get-CsvValue $r 'Storage Used (Byte)'), [ref]$bytes)
+            $mailboxByUpn[$upn.ToLowerInvariant()] = [pscustomobject]@{
+                RecipientType = Get-CsvValue $r 'Recipient Type'
+                StorageGB     = [math]::Round($bytes / 1GB, 2)
+                HasArchive    = ((Get-CsvValue $r 'Has Archive') -eq 'True')
+            }
+        }
+    }
+    else { $dataGaps.Add('Mailbox usage report unavailable or has no Recipient Type column. Shared mailbox check skipped.') }
+}
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- ANALYSE ---------------------------
+$findings        = New-Object System.Collections.Generic.List[object]
+$reclaimBySku    = @{}   # skuId -> HashSet of user ids (distinct reclaimable units)
+
+function Add-Reclaim { param([string]$SkuId, [string]$UserId)
+    $k = "$SkuId".ToLowerInvariant()
+    if (-not $reclaimBySku.ContainsKey($k)) { $reclaimBySku[$k] = New-Object 'System.Collections.Generic.HashSet[string]' }
+    [void]$reclaimBySku[$k].Add("$UserId|$k")
+}
+
+function New-Finding {
+    param([int]$Priority, [string]$Finding, [string]$RowType, $User, [string]$SkuId,
+          [string]$AssignedVia, [string]$Recommendation, [hashtable]$Extra = @{})
+    $o = [ordered]@{
+        Priority          = $Priority
+        Finding           = $Finding
+        RowType           = $RowType
+        UserPrincipalName = if ($User) { $User.userPrincipalName } else { '' }
+        DisplayName       = if ($User) { $User.displayName } else { '' }
+        Department        = if ($User) { $User.department } else { '' }
+        AccountEnabled    = if ($User) { $User.accountEnabled } else { '' }
+        UserType          = if ($User) { $User.userType } else { '' }
+        LastSignIn        = ''
+        LastWorkloadActivity = ''
+        Licence           = if ($SkuId) { Get-SkuLabel $SkuId } else { '' }
+        SkuPartNumber     = if ($SkuId) { Get-SkuPart $SkuId } else { '' }
+        AssignedVia       = $AssignedVia
+        Purchased         = ''
+        Assigned          = ''
+        Available         = ''
+        ReclaimableFromUsers = ''
+        PotentialFreeUnits = ''
+        EstMonthlySaving  = ''
+        LifecycleDate     = ''
+        Recommendation    = $Recommendation
+    }
+    foreach ($k in $Extra.Keys) { $o[$k] = $Extra[$k] }
+    $findings.Add([pscustomobject]$o)
+}
+
+foreach ($u in $licensedUsers) {
+    $upn   = [string]$u.userPrincipalName
+    $key   = $upn.ToLowerInvariant()
+    if (Test-Excluded $upn) { continue }
+
+    $userSkuIds = @($u.assignedLicenses | ForEach-Object { "$($_.skuId)".ToLowerInvariant() } | Sort-Object -Unique)
+    $userParts  = @($userSkuIds | ForEach-Object { Get-SkuPart $_ })
+
+    # How each SKU was assigned
+    $viaBySku = @{}
+    foreach ($st in @($u.licenseAssignmentStates)) {
+        $sk = "$($st.skuId)".ToLowerInvariant()
+        $label = if ($st.assignedByGroup) {
+            $gid = "$($st.assignedByGroup)".ToLowerInvariant()
+            'Group: ' + $(if ($groupNames.ContainsKey($gid)) { $groupNames[$gid] } else { $gid })
+        } else { 'Direct' }
+        if (-not $viaBySku.ContainsKey($sk)) { $viaBySku[$sk] = New-Object System.Collections.Generic.List[string] }
+        if (-not $viaBySku[$sk].Contains($label)) { $viaBySku[$sk].Add($label) }
+
+        if ($st.state -eq 'Error') {
+            New-Finding -Priority 1 -Finding 'Licence Assignment Error' -RowType 'User' -User $u -SkuId $sk `
+                -AssignedVia $label -Recommendation "Assignment failed ($($st.error)). User may be missing services. Fix the conflict or free up units."
+        }
+    }
+    $via = { param($s) if ($viaBySku.ContainsKey($s)) { $viaBySku[$s] -join ' + ' } else { 'Direct' } }
+
+    $lastSignIn = $null
+    if ($signInAvailable -and $u.signInActivity) {
+        $lastSignIn = Get-LatestDate @($u.signInActivity.lastSignInDateTime,
+                                       $u.signInActivity.lastNonInteractiveSignInDateTime,
+                                       $u.signInActivity.lastSuccessfulSignInDateTime)
+    }
+    $lastActivity = if ($activityByUpn.ContainsKey($key)) { $activityByUpn[$key] } else { $null }
+    $created      = ConvertTo-UtcDate $u.createdDateTime
+    $extraDates   = @{
+        LastSignIn           = if ($lastSignIn)   { $lastSignIn.ToString('yyyy-MM-dd') }   elseif ($signInAvailable) { 'Never' } else { 'n/a' }
+        LastWorkloadActivity = if ($lastActivity) { $lastActivity.ToString('yyyy-MM-dd') } elseif ($usageAvailable)  { 'None in period' } else { 'n/a' }
+    }
+
+    # --- Reclaim findings: one primary finding per user, most certain first ---
+    $reclaimFlagged = $false
+    if ($u.accountEnabled -eq $false) {
+        foreach ($s in $userSkuIds) {
+            New-Finding -Priority 1 -Finding 'Disabled Account Licensed' -RowType 'User' -User $u -SkuId $s `
+                -AssignedVia (& $via $s) -Extra $extraDates `
+                -Recommendation 'Account is disabled. Reclaim the licence (convert to shared mailbox first if the mailbox must be kept).'
+            Add-Reclaim $s $u.id
+        }
+        $reclaimFlagged = $true
+    }
+    else {
+        $signInStale  = (-not $signInAvailable) -or (-not $lastSignIn) -or ($lastSignIn -lt $inactiveCut)
+        $activityStale = (-not $usageAvailable) -or (-not $lastActivity) -or ($lastActivity -lt $inactiveCut)
+        $haveEvidence = $signInAvailable -or $usageAvailable
+        $oldEnough    = (-not $created) -or ($created -lt $graceCut)
+
+        if ($haveEvidence -and $signInStale -and $activityStale -and $oldEnough) {
+            $neverUsed = ($signInAvailable -and -not $lastSignIn) -and (-not $lastActivity)
+            $name = if ($neverUsed) { 'Never Signed In' } else { "Inactive $InactiveDays+ Days" }
+            foreach ($s in $userSkuIds) {
+                New-Finding -Priority 2 -Finding $name -RowType 'User' -User $u -SkuId $s -AssignedVia (& $via $s) `
+                    -Extra $extraDates -Recommendation 'No sign-in or workload use in the window. Confirm with the manager, then reclaim or offboard.'
+                Add-Reclaim $s $u.id
+            }
+            $reclaimFlagged = $true
+        }
+    }
+
+    # --- Shared mailbox holding a licence ---
+    if (-not $reclaimFlagged -and $mailboxByUpn.ContainsKey($key) -and $mailboxByUpn[$key].RecipientType -match 'Shared') {
+        $mb = $mailboxByUpn[$key]
+        $needsLicence = ($mb.StorageGB -ge 50) -or $mb.HasArchive
+        foreach ($s in $userSkuIds) {
+            if ($needsLicence) {
+                New-Finding -Priority 6 -Finding 'Shared Mailbox - Licence Likely Required' -RowType 'User' -User $u -SkuId $s `
+                    -AssignedVia (& $via $s) -Extra $extraDates `
+                    -Recommendation "Shared mailbox is $($mb.StorageGB) GB, archive=$($mb.HasArchive). Over 50 GB or archive needs a licence. Check it is the cheapest one that covers it (e.g. Exchange Online Plan 2)."
+            }
+            else {
+                New-Finding -Priority 2 -Finding 'Shared Mailbox Licensed' -RowType 'User' -User $u -SkuId $s `
+                    -AssignedVia (& $via $s) -Extra $extraDates `
+                    -Recommendation "Shared mailbox under 50 GB with no archive ($($mb.StorageGB) GB). Usually needs no licence - confirm no litigation hold, then reclaim."
+                Add-Reclaim $s $u.id
+            }
+        }
+        if (-not $needsLicence) { $reclaimFlagged = $true }
+    }
+
+    # --- Overlapping SKUs (only meaningful for active users; reclaim findings already cover the rest) ---
+    if (-not $reclaimFlagged) {
+        foreach ($superior in $OverlapRules.Keys) {
+            if ($userParts -notcontains $superior) { continue }
+            foreach ($s in $userSkuIds) {
+                $part = Get-SkuPart $s
+                if ($OverlapRules[$superior] -contains $part) {
+                    $supLabel = ($skuById.Values | Where-Object PartNumber -eq $superior | Select-Object -First 1).Name
+                    New-Finding -Priority 3 -Finding 'Overlapping SKU' -RowType 'User' -User $u -SkuId $s `
+                        -AssignedVia (& $via $s) -Extra $extraDates `
+                        -Recommendation "Also holds $supLabel, which likely covers this. Verify service plans, then remove this one."
+                    Add-Reclaim $s $u.id
+                }
+            }
+        }
+    }
+
+    # --- Guests with licences ---
+    if ($u.userType -eq 'Guest') {
+        foreach ($s in $userSkuIds) {
+            New-Finding -Priority 4 -Finding 'Guest Licensed' -RowType 'User' -User $u -SkuId $s -AssignedVia (& $via $s) `
+                -Extra $extraDates -Recommendation 'Guest (B2B) account holds a paid licence. Confirm it is intended; external users normally license in their home tenant.'
+        }
+    }
+
+    # --- Downgrade candidates: desktop-app SKU, active, but no Windows/Mac activation ---
+    if (-not $reclaimFlagged -and $usageAvailable -and $activationByUpn.Count -gt 0) {
+        $desktopSkus = @($userSkuIds | Where-Object { $DesktopAppSkus -contains (Get-SkuPart $_) })
+        $activations = if ($activationByUpn.ContainsKey($key)) { $activationByUpn[$key] } else { 0 }
+        $pastGrace   = (-not $created) -or ($created -lt $graceCut)
+        if ($desktopSkus.Count -gt 0 -and $activations -eq 0 -and $pastGrace) {
+            foreach ($s in $desktopSkus) {
+                New-Finding -Priority 5 -Finding 'Downgrade Candidate (No Desktop Apps)' -RowType 'User' -User $u -SkuId $s `
+                    -AssignedVia (& $via $s) -Extra $extraDates `
+                    -Recommendation 'Active user who has never activated desktop Office on Windows/Mac. Review for a web/mobile-only SKU (e.g. E1, F3, Business Basic).'
+            }
+        }
+    }
+}
+
+# ---- SKU rows ----
+$skuRows = New-Object System.Collections.Generic.List[object]
+foreach ($s in $skuById.Values) {
+    $isIgnored = ($IgnoreSkuPartNumbers -contains $s.PartNumber) -or ($s.Enabled -ge 10000) -or ($s.AppliesTo -and $s.AppliesTo -ne 'User')
+    $available  = [math]::Max(0, $s.Enabled - $s.Consumed)
+    $reclaim    = if ($reclaimBySku.ContainsKey($s.SkuId)) { $reclaimBySku[$s.SkuId].Count } else { 0 }
+    $potential  = if ($isIgnored) { 0 } else { $available + $reclaim }
+    $cost       = if ($SkuMonthlyCost.ContainsKey($s.PartNumber)) { [double]$SkuMonthlyCost[$s.PartNumber] } else { $null }
+    $saving     = if ($null -ne $cost -and $potential -gt 0) { [math]::Round($potential * $cost, 2) } else { '' }
+
+    $priority = 9; $finding = 'OK'; $rec = ''
+    if ($s.Suspended -gt 0) {
+        $priority = 1; $finding = 'Units Suspended'
+        $rec = "$($s.Suspended) units suspended. Users on them lose service - renew or reassign now."
+    }
+    elseif ($s.Warning -gt 0) {
+        $priority = 1; $finding = 'Units In Grace Period'
+        $rec = "$($s.Warning) units in warning (expired, grace period). Decide renew vs. let lapse before they suspend."
+    }
+    elseif (-not $isIgnored -and $s.Consumed -gt $s.Enabled) {
+        $priority = 1; $finding = 'Over-Assigned'
+        $rec = "Assigned $($s.Consumed) of $($s.Enabled) purchased. Expect assignment errors."
+    }
+    elseif (-not $isIgnored -and $available -gt 0) {
+        $priority = 2; $finding = 'Unassigned Licences'
+        $rec = "$available paid licences unassigned. Use for new starters or reduce at renewal."
+    }
+    elseif ($isIgnored) { $finding = 'Free / Tenant-Level SKU'; $priority = 10 }
+
+    if ($reclaim -gt 0 -and $priority -ge 9) {
+        $priority = 2; $finding = 'Reclaimable From Users'
+        $rec = "$reclaim assigned licences flagged on users (disabled/inactive/shared/overlap). See the User rows."
+    }
+
+    $skuRows.Add([pscustomobject]@{
+        Priority = $priority; Finding = $finding; RowType = 'SKU'
+        UserPrincipalName = ''; DisplayName = ''; Department = ''; AccountEnabled = ''; UserType = ''
+        LastSignIn = ''; LastWorkloadActivity = ''
+        Licence = $s.Name; SkuPartNumber = $s.PartNumber; AssignedVia = ''
+        Purchased = $s.Enabled; Assigned = $s.Consumed; Available = $available
+        ReclaimableFromUsers = $reclaim; PotentialFreeUnits = $potential; EstMonthlySaving = $saving
+        LifecycleDate = ''; Recommendation = $rec
+        _Ignored = $isIgnored
+    })
+}
+
+# ---- Subscription lifecycle rows ----
+$renewalCut = $nowUtc.AddDays($RenewalWindowDays)
+foreach ($sub in $subscriptions) {
+    $life = ConvertTo-UtcDate $sub.nextLifecycleDateTime
+    if (-not $life -or $life -gt $renewalCut) { continue }
+    $part = [string]$sub.skuPartNumber
+    if ($IgnoreSkuPartNumbers -contains $part) { continue }
+    $days = [int][math]::Floor(($life - $nowUtc).TotalDays)
+    $trial = if ($sub.isTrial) { ' (TRIAL)' } else { '' }
+    $findings.Add([pscustomobject]@{
+        Priority = 3; Finding = 'Renewal / Lifecycle Due'; RowType = 'Subscription'
+        UserPrincipalName = ''; DisplayName = ''; Department = ''; AccountEnabled = ''; UserType = ''
+        LastSignIn = ''; LastWorkloadActivity = ''
+        Licence = (Get-SkuLabel ([string]$sub.skuId)) + $trial; SkuPartNumber = $part; AssignedVia = ''
+        Purchased = $sub.totalLicenses; Assigned = ''; Available = ''
+        ReclaimableFromUsers = ''; PotentialFreeUnits = ''; EstMonthlySaving = ''
+        LifecycleDate = $life.ToString('yyyy-MM-dd')
+        Recommendation = "Status $($sub.status), next lifecycle event in $days days. True-down decision window - check the SKU row's PotentialFreeUnits."
+    })
+}
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- OUTPUT ----------------------------
+$allRows = @($skuRows | Select-Object -Property * -ExcludeProperty _Ignored) + $findings.ToArray()
+$sorted  = @($allRows | Sort-Object Priority, @{ Expression = { if ($_.RowType -eq 'SKU') { 0 } elseif ($_.RowType -eq 'Subscription') { 1 } else { 2 } } }, Licence, UserPrincipalName)
+
+$stamp   = $nowUtc.ToString('yyyyMMdd-HHmm')
+$csvPath = Join-Path ([System.IO.Path]::GetTempPath()) "LicenceOptimization-$stamp.csv"
+$sorted | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding utf8
+
+# Headline numbers (paid, user-assignable SKUs only)
+$paidSkus         = @($skuRows | Where-Object { -not $_._Ignored })
+$totPurchased     = ($paidSkus | Measure-Object Purchased -Sum).Sum
+$totAssigned      = ($paidSkus | Measure-Object Assigned -Sum).Sum
+$totAvailable     = ($paidSkus | Measure-Object Available -Sum).Sum
+$totReclaim       = ($paidSkus | Measure-Object ReclaimableFromUsers -Sum).Sum
+$savingValues     = @($paidSkus | Where-Object { $_.EstMonthlySaving -ne '' } | ForEach-Object { [double]$_.EstMonthlySaving })
+$totSaving        = if ($savingValues.Count) { [math]::Round(($savingValues | Measure-Object -Sum).Sum, 2) } else { $null }
+
+$userFindings     = @($findings | Where-Object RowType -eq 'User')
+$findingCounts    = @($userFindings | Group-Object Finding | Sort-Object { ($userFindings | Where-Object Finding -eq $_.Name | Select-Object -First 1).Priority })
+$distinctUsers    = @($userFindings | Select-Object -ExpandProperty UserPrincipalName -Unique).Count
+$topCandidates    = @($userFindings | Where-Object { $_.Priority -le 2 } | Select-Object -First $TopCandidatesInEmail)
+$renewals         = @($findings | Where-Object RowType -eq 'Subscription')
+
+$th = 'style="background:#f0f0f0;text-align:left;padding:5px;border:1px solid #ccc"'
+$td = 'style="padding:5px;border:1px solid #ccc"'
+$tdr = 'style="padding:5px;border:1px solid #ccc;text-align:right"'
+
+$sb = New-Object System.Text.StringBuilder
+[void]$sb.Append('<html><body style="font-family:Segoe UI,Arial,sans-serif;font-size:13px;color:#222">')
+[void]$sb.Append("<h2 style='margin-bottom:4px'>Licensing optimization review - $(ConvertTo-HtmlSafe $TenantLabel)</h2>")
+[void]$sb.Append("<p style='margin-top:0;color:#555'>Quarterly review, $($nowUtc.ToString('yyyy-MM-dd')) UTC. Read-only - nothing was changed. Full detail in the attached CSV.</p>")
+
+if ($dataGaps.Count -gt 0) {
+    [void]$sb.Append('<div style="background:#fff4e5;border-left:4px solid #e08a00;padding:8px 12px;margin:10px 0"><b>Data gaps - some checks did not run:</b><ul style="margin:4px 0">')
+    foreach ($g in $dataGaps) { [void]$sb.Append("<li>$(ConvertTo-HtmlSafe $g)</li>") }
+    [void]$sb.Append('</ul></div>')
+}
+
+[void]$sb.Append('<h3>Headline (paid, user-assignable SKUs)</h3><table style="border-collapse:collapse">')
+[void]$sb.Append("<tr><td $td>Purchased</td><td $tdr>$totPurchased</td></tr>")
+[void]$sb.Append("<tr><td $td>Assigned</td><td $tdr>$totAssigned</td></tr>")
+[void]$sb.Append("<tr><td $td>Unassigned (idle)</td><td $tdr><b>$totAvailable</b></td></tr>")
+[void]$sb.Append("<tr><td $td>Assigned but reclaimable</td><td $tdr><b>$totReclaim</b></td></tr>")
+if ($null -ne $totSaving) {
+    [void]$sb.Append("<tr><td $td>Est. monthly saving if all recovered</td><td $tdr><b>$totSaving $(ConvertTo-HtmlSafe $CurrencyLabel)</b></td></tr>")
+}
+[void]$sb.Append("<tr><td $td>Users with at least one finding</td><td $tdr>$distinctUsers</td></tr></table>")
+
+[void]$sb.Append("<h3>By SKU</h3><table style='border-collapse:collapse'><tr><th $th>Licence</th><th $th>Purchased</th><th $th>Assigned</th><th $th>Unassigned</th><th $th>Reclaimable</th><th $th>Status</th></tr>")
+foreach ($s in ($paidSkus | Sort-Object Priority, Licence)) {
+    $color = if ($s.Priority -le 1) { 'color:#b00020;font-weight:600;' } else { '' }
+    [void]$sb.Append("<tr><td $td>$(ConvertTo-HtmlSafe $s.Licence)</td><td $tdr>$($s.Purchased)</td><td $tdr>$($s.Assigned)</td><td $tdr>$($s.Available)</td><td $tdr>$($s.ReclaimableFromUsers)</td><td style='padding:5px;border:1px solid #ccc;$color'>$(ConvertTo-HtmlSafe $s.Finding)</td></tr>")
+}
+[void]$sb.Append('</table>')
+
+if ($renewals.Count -gt 0) {
+    [void]$sb.Append("<h3>Renewals / lifecycle events in the next $RenewalWindowDays days</h3><table style='border-collapse:collapse'><tr><th $th>Date</th><th $th>Licence</th><th $th>Units</th></tr>")
+    foreach ($r in ($renewals | Sort-Object LifecycleDate)) {
+        [void]$sb.Append("<tr><td $td>$($r.LifecycleDate)</td><td $td>$(ConvertTo-HtmlSafe $r.Licence)</td><td $tdr>$($r.Purchased)</td></tr>")
+    }
+    [void]$sb.Append('</table>')
+}
+
+if ($findingCounts.Count -gt 0) {
+    [void]$sb.Append("<h3>User findings</h3><table style='border-collapse:collapse'><tr><th $th>Finding</th><th $th>Licence rows</th></tr>")
+    foreach ($f in $findingCounts) { [void]$sb.Append("<tr><td $td>$(ConvertTo-HtmlSafe $f.Name)</td><td $tdr>$($f.Count)</td></tr>") }
+    [void]$sb.Append('</table>')
+}
+
+if ($topCandidates.Count -gt 0) {
+    [void]$sb.Append("<h3>Top reclaim candidates</h3><table style='border-collapse:collapse'><tr><th $th>User</th><th $th>Finding</th><th $th>Licence</th><th $th>Assigned via</th><th $th>Last sign-in</th></tr>")
+    foreach ($c in $topCandidates) {
+        [void]$sb.Append("<tr><td $td>$(ConvertTo-HtmlSafe $c.UserPrincipalName)</td><td $td>$(ConvertTo-HtmlSafe $c.Finding)</td><td $td>$(ConvertTo-HtmlSafe $c.Licence)</td><td $td>$(ConvertTo-HtmlSafe $c.AssignedVia)</td><td $td>$(ConvertTo-HtmlSafe $c.LastSignIn)</td></tr>")
+    }
+    [void]$sb.Append('</table>')
+}
+
+[void]$sb.Append("<p style='color:#888;font-size:11px'>Generated by Runbook 14 (14-Review-LicenseOptimization.ps1), Azure Automation, managed identity. Group-assigned licences are reclaimed by removing the user from the group.</p></body></html>")
+$html = $sb.ToString()
+
+# Job log summary
+Write-Output ("Paid SKUs: purchased {0}, assigned {1}, unassigned {2}, reclaimable {3}" -f $totPurchased, $totAssigned, $totAvailable, $totReclaim)
+foreach ($f in $findingCounts) { Write-Output ("  {0,-42} {1}" -f $f.Name, $f.Count) }
+foreach ($g in $dataGaps) { Write-Output "  DATA GAP: $g" }
+
+if ($SendEmail) {
+    $flag    = if (($totAvailable + $totReclaim) -gt 0) { "[$($totAvailable + $totReclaim) licences recoverable] " } else { '' }
+    $subject = "${flag}Licensing optimization review - $TenantLabel - $($nowUtc.ToString('yyyy-MM-dd'))"
+    try {
+        Send-ReportEmail -From $SenderMailbox -To $Recipients -Subject $subject -HtmlBody $html -AttachmentPath $csvPath
+        Write-Output "Report emailed to $($Recipients -join ', ')."
+    }
+    catch {
+        Write-Error "sendMail failed from $SenderMailbox. Check Mail.Send and the application access policy scope. $($_.Exception.Message)"
+        throw
+    }
+    Remove-Item -LiteralPath $csvPath -Force -ErrorAction SilentlyContinue
+}
+else {
+    Write-Output "SendEmail is off. CSV written to $csvPath."
+}
+#endregion -------------------------------------------------------------

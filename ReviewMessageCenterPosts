@@ -1,0 +1,371 @@
+<#
+.SYNOPSIS
+    Runbook 13 - Microsoft 365 Message Center review and triage.
+
+.DESCRIPTION
+    Pulls Message Center posts (planned changes, retirements, new features)
+    from Microsoft Graph, classifies each into a triage category, and emails
+    a risk-ranked CSV + HTML summary.
+
+    Kept separate from Runbook 11 (service health) on purpose: that runbook is
+    the daily outage signal, this one is the weekly change-planning signal.
+
+    Posts included in a run:
+      - Any post created or updated within the last $LookbackDays days.
+      - PLUS (if $IncludeOpenActionItems) any older, still-live post whose
+        action-required date is in the future or passed no more than
+        $OverdueLookbackDays ago. This stops a deadline from vanishing out of
+        the report one week after the post was published.
+
+    Triage categories (rank 1 = most urgent):
+      1  Action Required - Overdue     action date already passed
+      2  Action Required - Due Soon    action date within $DueSoonDays
+      3  Retirement / Deprecation      Retirement tag or retire/deprecate wording in title
+      4  Action Required - Scheduled   action date further out than $DueSoonDays
+      5  Major Change                  Microsoft flagged isMajorChange
+      6  Admin Impact                  Admin impact tag, or preventOrFixIssue category
+      7  User Impact / Feature Change  User impact / Feature update / New feature tags
+      8  Informational                 everything else
+
+    Each post gets exactly one category, the highest-ranked one it qualifies for.
+    Microsoft's own category/tags/severity are kept as raw columns in the CSV.
+
+.NOTES
+    Auth       : Automation Account system-assigned Managed Identity
+                 (Connect-MgGraph -Identity). No secrets, no certificates.
+    Graph perms: ServiceMessage.Read.All  (NEW - add to the pending CR addendum)
+                 Mail.Send                (already granted)
+    Admin role : none. Graph application permissions only.
+    Modules    : Microsoft.Graph.Authentication only (no PnP, no PowerShell version floor).
+    Schedule   : weekly, set on the Automation Account schedule. Keep $LookbackDays
+                 equal to the schedule interval so no post falls between runs.
+
+    Send-ReportEmail is inlined (no $PSScriptRoot dot-source) so the script works
+    when pasted into the Automation Account runbook editor. If the canonical
+    Send-ReportEmail.ps1 from "Automation on MT.zip" differs from this copy,
+    replace this function body with that one so every runbook behaves the same.
+#>
+
+#region ---------------------------- CONFIG ----------------------------
+$TenantLabel            = 'CrucialLogics'                      # appears in the email subject
+$SenderMailbox          = 'm365-audits@cruciallogics.com'      # must be in the Mail.Send application access policy scope
+$Recipients             = @('replace-me@cruciallogics.com')    # one or more addresses
+
+$LookbackDays           = 7      # match the schedule interval (weekly = 7)
+$DueSoonDays            = 30     # action date within this many days = "Due Soon"
+$IncludeOpenActionItems = $true  # carry older posts that still have a live action deadline
+$OverdueLookbackDays    = 30     # stop carrying overdue posts after this many days past due
+
+# Workload filters. Match against the post's "services" values,
+# e.g. 'Exchange Online', 'SharePoint Online', 'Microsoft Teams', 'Microsoft 365 suite'.
+# Empty = no filter. A post is excluded only if EVERY service it lists is excluded.
+$IncludeServices        = @()
+$ExcludeServices        = @()
+
+$ExcerptLength          = 400    # characters of plain-text body kept per post in the CSV
+$SendEmail              = $true  # $false = build the CSV and write the summary to the job output only
+#endregion -------------------------------------------------------------
+
+$ErrorActionPreference = 'Stop'
+
+#region ---------------------------- HELPERS ---------------------------
+function Send-ReportEmail {
+    param(
+        [Parameter(Mandatory)] [string]   $From,
+        [Parameter(Mandatory)] [string[]] $To,
+        [Parameter(Mandatory)] [string]   $Subject,
+        [Parameter(Mandatory)] [string]   $HtmlBody,
+        [string] $AttachmentPath
+    )
+
+    $message = @{
+        subject      = $Subject
+        body         = @{ contentType = 'HTML'; content = $HtmlBody }
+        toRecipients = @($To | ForEach-Object { @{ emailAddress = @{ address = $_ } } })
+    }
+
+    if ($AttachmentPath -and (Test-Path -LiteralPath $AttachmentPath)) {
+        $bytes = [System.IO.File]::ReadAllBytes($AttachmentPath)
+        if ($bytes.Length -gt 3MB) {
+            Write-Warning "Attachment is $([math]::Round($bytes.Length / 1MB, 2)) MB, over the 3 MB sendMail limit. Sending without it."
+        }
+        else {
+            $message.attachments = @(@{
+                '@odata.type' = '#microsoft.graph.fileAttachment'
+                name          = [System.IO.Path]::GetFileName($AttachmentPath)
+                contentType   = 'text/csv'
+                contentBytes  = [System.Convert]::ToBase64String($bytes)
+            })
+        }
+    }
+
+    $payload = @{ message = $message; saveToSentItems = $false } | ConvertTo-Json -Depth 10
+    Invoke-MgGraphRequest -Method POST `
+        -Uri "https://graph.microsoft.com/v1.0/users/$From/sendMail" `
+        -Body $payload -ContentType 'application/json' | Out-Null
+}
+
+function ConvertTo-UtcDate {
+    param($Value)
+    if ($null -eq $Value -or "$Value" -eq '') { return $null }
+    if ($Value -is [datetime])       { return $Value.ToUniversalTime() }
+    if ($Value -is [datetimeoffset]) { return $Value.UtcDateTime }
+    $parsed = [datetimeoffset]::MinValue
+    if ([datetimeoffset]::TryParse([string]$Value, [cultureinfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) {
+        return $parsed.UtcDateTime
+    }
+    return $null
+}
+
+function ConvertTo-PlainText {
+    param([string]$Html, [int]$MaxLength)
+    if ([string]::IsNullOrWhiteSpace($Html)) { return '' }
+    $text = [regex]::Replace($Html, '<[^>]+>', ' ')
+    $text = [System.Net.WebUtility]::HtmlDecode($text)
+    $text = [regex]::Replace($text, '\s+', ' ').Trim()
+    if ($text.Length -gt $MaxLength) { $text = $text.Substring(0, $MaxLength).TrimEnd() + '...' }
+    return $text
+}
+
+function Test-ServiceFilter {
+    param([string[]]$Services)
+    $svc = @($Services | Where-Object { $_ })
+    if ($IncludeServices.Count -gt 0) {
+        if (-not ($svc | Where-Object { $IncludeServices -contains $_ })) { return $false }
+    }
+    if ($ExcludeServices.Count -gt 0 -and $svc.Count -gt 0) {
+        $remaining = @($svc | Where-Object { $ExcludeServices -notcontains $_ })
+        if ($remaining.Count -eq 0) { return $false }
+    }
+    return $true
+}
+
+function Get-TriageCategory {
+    param(
+        [string[]] $Tags,
+        [string]   $Title,
+        [string]   $NativeCategory,
+        [bool]     $IsMajorChange,
+        $DueUtc,
+        [datetime] $NowUtc
+    )
+    $tagSet = @($Tags | ForEach-Object { "$_".Trim().ToLowerInvariant() })
+
+    if ($DueUtc) {
+        if ($DueUtc -lt $NowUtc) {
+            return @{ Rank = 1; Name = 'Action Required - Overdue' }
+        }
+        if ($DueUtc -le $NowUtc.AddDays($DueSoonDays)) {
+            return @{ Rank = 2; Name = 'Action Required - Due Soon' }
+        }
+    }
+    if ($tagSet -contains 'retirement' -or
+        $Title -match '(?i)\bretir(e|es|ed|ing|ement)\b|deprecat|end[\s-]of[\s-](support|life)|\bsunset') {
+        return @{ Rank = 3; Name = 'Retirement / Deprecation' }
+    }
+    if ($DueUtc) {
+        return @{ Rank = 4; Name = 'Action Required - Scheduled' }
+    }
+    if ($IsMajorChange) {
+        return @{ Rank = 5; Name = 'Major Change' }
+    }
+    if ($tagSet -contains 'admin impact' -or $NativeCategory -eq 'preventOrFixIssue') {
+        return @{ Rank = 6; Name = 'Admin Impact' }
+    }
+    if ($tagSet -contains 'user impact' -or $tagSet -contains 'feature update' -or $tagSet -contains 'new feature') {
+        return @{ Rank = 7; Name = 'User Impact / Feature Change' }
+    }
+    return @{ Rank = 8; Name = 'Informational' }
+}
+
+function Get-NativeCategoryLabel {
+    param([string]$Value)
+    switch ($Value) {
+        'preventOrFixIssue' { 'Prevent or fix issue' }
+        'planForChange'     { 'Plan for change' }
+        'stayInformed'      { 'Stay informed' }
+        default             { $Value }
+    }
+}
+
+function Get-SeverityRank {
+    param([string]$Value)
+    switch ($Value) { 'critical' { 0 } 'high' { 1 } default { 2 } }
+}
+
+function ConvertTo-HtmlSafe { param([string]$Text) [System.Net.WebUtility]::HtmlEncode($Text) }
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- MAIN ------------------------------
+$nowUtc      = [datetime]::UtcNow
+$windowStart = $nowUtc.AddDays(-$LookbackDays)
+$overdueCut  = $nowUtc.AddDays(-$OverdueLookbackDays)
+
+Write-Output "Runbook 13 - Message Center review. Window: $($windowStart.ToString('yyyy-MM-dd HH:mm')) UTC to $($nowUtc.ToString('yyyy-MM-dd HH:mm')) UTC."
+
+try {
+    Connect-MgGraph -Identity -NoWelcome
+}
+catch {
+    Write-Error "Connect-MgGraph -Identity failed. Check the Automation Account's system-assigned identity is on. $($_.Exception.Message)"
+    throw
+}
+
+# Pull every message and filter client-side. Message Center volume is a few hundred
+# posts, so this is cheap and avoids depending on which $filter operators the
+# endpoint supports.
+$allMessages = New-Object System.Collections.Generic.List[object]
+$uri = 'https://graph.microsoft.com/v1.0/admin/serviceAnnouncement/messages'
+try {
+    while ($uri) {
+        $resp = Invoke-MgGraphRequest -Method GET -Uri $uri -OutputType PSObject
+        foreach ($m in @($resp.value)) { $allMessages.Add($m) }
+        $uri = $resp.'@odata.nextLink'
+    }
+}
+catch {
+    Write-Error ("Failed to read Message Center posts from $uri. " +
+        "A 403/Forbidden here means ServiceMessage.Read.All is not granted to the MI (or has not propagated yet). " +
+        $_.Exception.Message)
+    throw
+}
+Write-Output "Retrieved $($allMessages.Count) Message Center posts in total."
+
+$rows = New-Object System.Collections.Generic.List[object]
+foreach ($m in $allMessages) {
+    $services = @($m.services | Where-Object { $_ })
+    if (-not (Test-ServiceFilter -Services $services)) { continue }
+
+    $startUtc    = ConvertTo-UtcDate $m.startDateTime
+    $endUtc      = ConvertTo-UtcDate $m.endDateTime
+    $modifiedUtc = ConvertTo-UtcDate $m.lastModifiedDateTime
+    $dueUtc      = ConvertTo-UtcDate $m.actionRequiredByDateTime
+
+    $inWindow   = $modifiedUtc -and $modifiedUtc -ge $windowStart
+    $stillLive  = (-not $endUtc) -or ($endUtc -gt $nowUtc)
+    $openAction = $IncludeOpenActionItems -and $dueUtc -and $stillLive -and ($dueUtc -ge $overdueCut)
+
+    if (-not ($inWindow -or $openAction)) { continue }
+
+    $changeType = if ($inWindow -and $startUtc -and $startUtc -ge $windowStart) { 'New' }
+                  elseif ($inWindow) { 'Updated' }
+                  else { 'Carried Over (open action)' }
+
+    $tags     = @($m.tags | Where-Object { $_ })
+    $category = Get-TriageCategory -Tags $tags -Title ([string]$m.title) `
+                    -NativeCategory ([string]$m.category) -IsMajorChange ([bool]$m.isMajorChange) `
+                    -DueUtc $dueUtc -NowUtc $nowUtc
+
+    $daysUntil = if ($dueUtc) { [int][math]::Floor(($dueUtc - $nowUtc).TotalDays) } else { $null }
+
+    $rows.Add([pscustomobject]@{
+        Priority         = $category.Rank
+        TriageCategory   = $category.Name
+        ChangeType       = $changeType
+        MessageId        = $m.id
+        Title            = $m.title
+        Workload         = ($services -join '; ')
+        NativeCategory   = Get-NativeCategoryLabel ([string]$m.category)
+        Severity         = $m.severity
+        IsMajorChange    = [bool]$m.isMajorChange
+        Tags             = ($tags -join '; ')
+        ActionRequiredBy = if ($dueUtc) { $dueUtc.ToString('yyyy-MM-dd') } else { '' }
+        DaysUntilAction  = $daysUntil
+        Published        = if ($startUtc) { $startUtc.ToString('yyyy-MM-dd') } else { '' }
+        LastUpdated      = if ($modifiedUtc) { $modifiedUtc.ToString('yyyy-MM-dd') } else { '' }
+        Excerpt          = ConvertTo-PlainText -Html ([string]$m.body.content) -MaxLength $ExcerptLength
+        PortalLink       = "https://admin.microsoft.com/#/MessageCenter/:/messages/$($m.id)"
+        _SeverityRank    = Get-SeverityRank ([string]$m.severity)
+        _DueSort         = if ($dueUtc) { $dueUtc } else { [datetime]::MaxValue }
+    })
+}
+
+$sorted = @($rows | Sort-Object Priority, _SeverityRank, _DueSort, @{ Expression = 'LastUpdated'; Descending = $true })
+$export = @($sorted | Select-Object -Property * -ExcludeProperty _SeverityRank, _DueSort)
+
+Write-Output "$($export.Count) posts in scope after window and workload filters."
+
+# ---- CSV ----
+$stamp   = $nowUtc.ToString('yyyyMMdd-HHmm')
+$csvPath = Join-Path ([System.IO.Path]::GetTempPath()) "MessageCenterReview-$stamp.csv"
+if ($export.Count -gt 0) {
+    $export | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding utf8
+}
+
+# ---- HTML summary ----
+$categoryCounts = @($export | Group-Object TriageCategory |
+    Sort-Object { ($export | Where-Object TriageCategory -eq $_.Name | Select-Object -First 1).Priority })
+
+$workloadCounts = @($export | ForEach-Object { $_.Workload -split '; ' } | Where-Object { $_ } |
+    Group-Object | Sort-Object Count -Descending | Select-Object -First 10)
+
+$actionItems = @($export | Where-Object { $_.Priority -le 2 })
+
+$sb = New-Object System.Text.StringBuilder
+[void]$sb.Append('<html><body style="font-family:Segoe UI,Arial,sans-serif;font-size:13px;color:#222">')
+[void]$sb.Append("<h2 style='margin-bottom:4px'>Message Center review - $(ConvertTo-HtmlSafe $TenantLabel)</h2>")
+[void]$sb.Append("<p style='margin-top:0;color:#555'>Posts created or updated $($windowStart.ToString('yyyy-MM-dd')) to $($nowUtc.ToString('yyyy-MM-dd')) (UTC)")
+if ($IncludeOpenActionItems) { [void]$sb.Append(', plus older posts with a live action deadline') }
+[void]$sb.Append(". Full detail in the attached CSV.</p>")
+
+if ($export.Count -eq 0) {
+    [void]$sb.Append('<p><b>No Message Center posts in scope for this period.</b></p>')
+}
+else {
+    [void]$sb.Append('<h3>By triage category</h3><table cellpadding="5" style="border-collapse:collapse;border:1px solid #ccc">')
+    [void]$sb.Append('<tr style="background:#f0f0f0"><th align="left">Category</th><th align="right">Posts</th></tr>')
+    foreach ($g in $categoryCounts) {
+        $style = if ($g.Name -like 'Action Required - Overdue' -or $g.Name -like 'Action Required - Due Soon') { ' style="color:#b00020;font-weight:600"' } else { '' }
+        [void]$sb.Append("<tr><td$style>$(ConvertTo-HtmlSafe $g.Name)</td><td align='right'>$($g.Count)</td></tr>")
+    }
+    [void]$sb.Append('</table>')
+
+    if ($actionItems.Count -gt 0) {
+        [void]$sb.Append("<h3>Action required within $DueSoonDays days (or overdue)</h3>")
+        [void]$sb.Append('<table cellpadding="5" style="border-collapse:collapse;border:1px solid #ccc">')
+        [void]$sb.Append('<tr style="background:#f0f0f0"><th align="left">Due</th><th align="right">Days</th><th align="left">ID</th><th align="left">Title</th><th align="left">Workload</th></tr>')
+        foreach ($a in $actionItems) {
+            [void]$sb.Append("<tr><td>$($a.ActionRequiredBy)</td><td align='right'>$($a.DaysUntilAction)</td>" +
+                "<td><a href='$($a.PortalLink)'>$(ConvertTo-HtmlSafe $a.MessageId)</a></td>" +
+                "<td>$(ConvertTo-HtmlSafe $a.Title)</td><td>$(ConvertTo-HtmlSafe $a.Workload)</td></tr>")
+        }
+        [void]$sb.Append('</table>')
+    }
+
+    if ($workloadCounts.Count -gt 0) {
+        [void]$sb.Append('<h3>By workload (top 10)</h3><table cellpadding="5" style="border-collapse:collapse;border:1px solid #ccc">')
+        [void]$sb.Append('<tr style="background:#f0f0f0"><th align="left">Workload</th><th align="right">Posts</th></tr>')
+        foreach ($w in $workloadCounts) {
+            [void]$sb.Append("<tr><td>$(ConvertTo-HtmlSafe $w.Name)</td><td align='right'>$($w.Count)</td></tr>")
+        }
+        [void]$sb.Append('</table>')
+    }
+}
+[void]$sb.Append("<p style='color:#888;font-size:11px'>Generated by Runbook 13 (13-Review-MessageCenterPosts.ps1), Azure Automation, managed identity.</p>")
+[void]$sb.Append('</body></html>')
+$html = $sb.ToString()
+
+# ---- Job output summary (visible in the Automation job log) ----
+foreach ($g in $categoryCounts) { Write-Output ("  {0,-32} {1}" -f $g.Name, $g.Count) }
+
+# ---- Send ----
+if ($SendEmail) {
+    $flag    = if ($actionItems.Count -gt 0) { "[$($actionItems.Count) action due] " } else { '' }
+    $subject = "${flag}Message Center review - $TenantLabel - $($nowUtc.ToString('yyyy-MM-dd'))"
+    try {
+        Send-ReportEmail -From $SenderMailbox -To $Recipients -Subject $subject -HtmlBody $html `
+            -AttachmentPath $(if ($export.Count -gt 0) { $csvPath } else { $null })
+        Write-Output "Report emailed to $($Recipients -join ', ')."
+    }
+    catch {
+        Write-Error "sendMail failed from $SenderMailbox. Check Mail.Send grant and the application access policy scope. $($_.Exception.Message)"
+        throw
+    }
+}
+else {
+    Write-Output "SendEmail is off. CSV written to $csvPath."
+}
+
+if ($SendEmail -and (Test-Path -LiteralPath $csvPath)) { Remove-Item -LiteralPath $csvPath -Force -ErrorAction SilentlyContinue }
+#endregion -------------------------------------------------------------

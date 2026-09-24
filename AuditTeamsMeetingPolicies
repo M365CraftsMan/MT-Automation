@@ -1,0 +1,282 @@
+<#
+.SYNOPSIS
+    Runbook 21 - Teams meeting policy review (all meeting policies + tenant meeting configuration).
+
+.DESCRIPTION
+    Read-only. Evaluates every Teams meeting policy against a baseline focused on who can get
+    into, run, present in and record meetings. Changes nothing.
+
+    Per policy (Global + every custom policy)
+      Fail  Anonymous users can START meetings
+      Warn  Lobby bypass for everyone (anonymous users walk straight in)
+      Warn  Dial-in (PSTN) callers bypass the lobby
+      Warn  Anonymous users can dial out (toll-fraud route)
+      Warn  Everyone, including external/anonymous, is a presenter by default
+      Warn  External participants can be given control of shared screens
+      Warn  Recordings can be stored outside the tenant's region
+      Info  Anonymous join allowed / recordings never expire / explicit recording consent off /
+            chat with untrusted external users in meetings
+      Info  Custom policy assigned to nobody (clean-up)
+    Tenant (Get-CsTeamsMeetingConfiguration)
+      Anonymous join switch and anonymous app interaction.
+
+    Assignment counts: direct (Get-CsOnlineUser) + group (Get-CsGroupPolicyAssignment), so a
+    Warn on a policy used by 3 people reads differently from one on Global.
+
+    Every setting is read defensively: settings that don't exist in the installed module version
+    are listed as "not returned", never silently passed.
+
+.NOTES
+    Auth        : Automation Account system-assigned Managed Identity, no secrets.
+                  MI tokens (Graph + "Skype and Teams Tenant Admin API") handed to
+                  Connect-MicrosoftTeams -AccessTokens; Global Reader authorises the reads.
+                  SAME MECHANISM AS RUNBOOK 20 SECTION B - confirm that works first.
+    Permissions : Entra role Global Reader on the MI (assigned); Graph Directory.Read.All (granted,
+                  group names); Graph Mail.Send (granted). No new CR scope.
+    Modules     : MicrosoftTeams - same version as Runbook 20 ($TeamsModuleVersion).
+    Schedule    : monthly per the maintenance sheet.
+
+    UNVERIFIED - first test run:
+      1. Token hand-off + Global Reader (shared with Runbook 20).
+      2. Get-CsOnlineUser with app auth in a large tenant can be slow; set $CountDirectAssignments
+         to $false if the job runs long - group assignments are still counted.
+#>
+
+#region ---------------------------- CONFIG ----------------------------
+$TenantLabel            = 'CrucialLogics'
+$SenderMailbox          = 'm365-audits@cruciallogics.com'
+$Recipients             = @('replace-me@cruciallogics.com')
+
+$TeamsModuleVersion     = ''       # same value as Runbook 20 once tested
+$CountDirectAssignments = $true
+$AllowAnonymousJoin     = $true    # $false if the client wants anonymous join flagged as Warn instead of Info
+$MaxRecordingDaysOk     = 120      # recordings kept longer than this (or forever) -> Info
+$SendEmail              = $true
+#endregion -------------------------------------------------------------
+
+$ErrorActionPreference = 'Stop'
+
+#region ---------------------------- HELPERS ---------------------------
+function Get-MIToken {
+    param([string]$Resource)
+    if (-not $env:IDENTITY_ENDPOINT -or -not $env:IDENTITY_HEADER) {
+        throw 'IDENTITY_ENDPOINT / IDENTITY_HEADER not set. Run this in Azure Automation with the system-assigned managed identity enabled.'
+    }
+    $uri = "$($env:IDENTITY_ENDPOINT)?resource=$([uri]::EscapeDataString($Resource))&api-version=2019-08-01"
+    (Invoke-RestMethod -Method GET -Uri $uri -Headers @{ 'X-IDENTITY-HEADER' = $env:IDENTITY_HEADER; 'Metadata' = 'True' }).access_token
+}
+
+function Send-ReportEmail {
+    param(
+        [Parameter(Mandatory)] [string]   $From,
+        [Parameter(Mandatory)] [string[]] $To,
+        [Parameter(Mandatory)] [string]   $Subject,
+        [Parameter(Mandatory)] [string]   $HtmlBody,
+        [string] $AttachmentPath
+    )
+    $message = @{
+        subject      = $Subject
+        body         = @{ contentType = 'HTML'; content = $HtmlBody }
+        toRecipients = @($To | ForEach-Object { @{ emailAddress = @{ address = $_ } } })
+    }
+    if ($AttachmentPath -and (Test-Path -LiteralPath $AttachmentPath)) {
+        $bytes = [System.IO.File]::ReadAllBytes($AttachmentPath)
+        if ($bytes.Length -gt 3MB) { Write-Warning 'Attachment over 3 MB, sending without it.' }
+        else {
+            $message.attachments = @(@{
+                '@odata.type' = '#microsoft.graph.fileAttachment'
+                name          = [System.IO.Path]::GetFileName($AttachmentPath)
+                contentType   = 'text/csv'
+                contentBytes  = [System.Convert]::ToBase64String($bytes)
+            })
+        }
+    }
+    $payload = @{ message = $message; saveToSentItems = $false } | ConvertTo-Json -Depth 10
+    Invoke-RestMethod -Method POST -Uri "https://graph.microsoft.com/v1.0/users/$From/sendMail" `
+        -Headers @{ Authorization = "Bearer $(Get-MIToken 'https://graph.microsoft.com/')" } -Body $payload -ContentType 'application/json' | Out-Null
+}
+
+function Get-Str { param($Obj, [string]$Name) $p = $Obj.PSObject.Properties[$Name]; if ($p -and $null -ne $p.Value) { "$($p.Value)" } else { $null } }
+function Get-StatusRank { param([string]$s) switch ($s) { 'Fail' { 1 } 'Warn' { 2 } 'Info' { 3 } default { 9 } } }
+function ConvertTo-HtmlSafe { param([string]$Text) [System.Net.WebUtility]::HtmlEncode($Text) }
+
+# Baseline: Setting, test on the value, status when the test is TRUE, finding text
+$Checks = @(
+    @{ S = 'AllowAnonymousUsersToStartMeeting';        T = { $args[0] -eq 'True' };        St = 'Fail'; F = 'Anonymous users can start meetings (no organiser present).' }
+    @{ S = 'AutoAdmittedUsers';                        T = { $args[0] -eq 'Everyone' };    St = 'Warn'; F = 'Lobby bypassed by everyone - anonymous users join without being admitted.' }
+    @{ S = 'AllowPSTNUsersToBypassLobby';              T = { $args[0] -eq 'True' };        St = 'Warn'; F = 'Dial-in callers bypass the lobby - anyone with the number and ID walks in.' }
+    @{ S = 'AllowAnonymousUsersToDialOut';             T = { $args[0] -eq 'True' };        St = 'Warn'; F = 'Anonymous users can dial out from meetings - toll-fraud route.' }
+    @{ S = 'DesignatedPresenterRoleMode';              T = { $args[0] -eq 'EveryoneUserOverride' }; St = 'Warn'; F = 'Everyone, including external and anonymous attendees, presents by default.' }
+    @{ S = 'AllowExternalParticipantGiveRequestControl'; T = { $args[0] -eq 'True' };      St = 'Warn'; F = 'External participants can be given or request control of a shared screen.' }
+    @{ S = 'AllowRecordingStorageOutsideRegion';       T = { $args[0] -eq 'True' };        St = 'Warn'; F = 'Recordings can be stored outside the tenant''s data region.' }
+    @{ S = 'AllowAnonymousUsersToJoinMeeting';         T = { $args[0] -eq 'True' };        St = $(if ($AllowAnonymousJoin) { 'Info' } else { 'Warn' }); F = 'Anonymous (not signed-in) users can join meetings.' }
+    @{ S = 'NewMeetingRecordingExpirationDays';        T = { $v = 0; [int]::TryParse("$($args[0])", [ref]$v) | Out-Null; ($v -eq -1) -or ($v -gt $MaxRecordingDaysOk) }; St = 'Info'; F = "Recordings never expire or are kept over $MaxRecordingDaysOk days - storage and retention exposure." }
+    @{ S = 'ExplicitRecordingConsent';                 T = { $args[0] -eq 'Disabled' };    St = 'Info'; F = 'Attendees are not asked for explicit consent before being recorded (may matter for local law).' }
+    @{ S = 'AllowExternalNonTrustedMeetingChat';       T = { $args[0] -eq 'True' };        St = 'Info'; F = 'Users from untrusted external organisations can use meeting chat.' }
+)
+$ShownSettings = @('AutoAdmittedUsers','AllowAnonymousUsersToJoinMeeting','AllowAnonymousUsersToStartMeeting','AllowPSTNUsersToBypassLobby',
+                   'DesignatedPresenterRoleMode','AllowCloudRecording','AllowTranscription','NewMeetingRecordingExpirationDays')
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- CONNECT ---------------------------
+$nowUtc = [datetime]::UtcNow
+$gaps   = New-Object System.Collections.Generic.List[string]
+Write-Output "Runbook 21 - Teams meeting policy review. $($nowUtc.ToString('yyyy-MM-dd HH:mm')) UTC."
+$graphToken = Get-MIToken 'https://graph.microsoft.com/'
+
+$step = 'import MicrosoftTeams module'
+try {
+    if ($TeamsModuleVersion) { Import-Module MicrosoftTeams -RequiredVersion $TeamsModuleVersion -ErrorAction Stop }
+    else { Import-Module MicrosoftTeams -ErrorAction Stop }
+    $step = 'get Teams admin API token'
+    $teamsToken = Get-MIToken '48ac35b8-9aa8-4d74-927d-1f4a14a0b239'
+    $step = 'Connect-MicrosoftTeams -AccessTokens'
+    Connect-MicrosoftTeams -AccessTokens @($graphToken, $teamsToken) -ErrorAction Stop | Out-Null
+    $step = 'Get-CsTeamsMeetingPolicy'
+    $policies = @(Get-CsTeamsMeetingPolicy -ErrorAction Stop)
+}
+catch {
+    Write-Error "Teams connection failed at step '$step': $($_.Exception.Message). This runbook uses the same token hand-off as Runbook 20 - fix that first."
+    throw
+}
+Write-Output "Meeting policies: $($policies.Count)."
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- ASSIGNMENTS -----------------------
+$directCount = @{}; $groupAssign = @{}; $directCounted = $false
+if ($CountDirectAssignments) {
+    try {
+        try { $users = @(Get-CsOnlineUser -ResultSize Unlimited -Properties UserPrincipalName, TeamsMeetingPolicy -ErrorAction Stop) }
+        catch { $users = @(Get-CsOnlineUser -ResultSize Unlimited -ErrorAction Stop) }
+        foreach ($u in $users) {
+            $p = Get-Str $u 'TeamsMeetingPolicy'
+            if (-not $p) { continue }   # blank = Global (or group-assigned)
+            $k = ($p -replace '^Tag:', '')
+            if (-not $directCount.ContainsKey($k)) { $directCount[$k] = 0 }
+            $directCount[$k]++
+        }
+        $directCounted = $true
+        Write-Output "Users scanned for direct assignments: $($users.Count)."
+    }
+    catch { $gaps.Add("Direct policy assignments not counted (Get-CsOnlineUser failed): $($_.Exception.Message)") }
+}
+try {
+    foreach ($ga in @(Get-CsGroupPolicyAssignment -PolicyType TeamsMeetingPolicy -ErrorAction Stop)) {
+        $k = "$($ga.PolicyName)"
+        $gname = "$($ga.GroupId)"
+        try {
+            $g = Invoke-RestMethod -Method GET -Uri "https://graph.microsoft.com/v1.0/groups/$($ga.GroupId)?`$select=displayName" -Headers @{ Authorization = "Bearer $graphToken" }
+            $gname = $g.displayName
+        } catch { }
+        if (-not $groupAssign.ContainsKey($k)) { $groupAssign[$k] = New-Object System.Collections.Generic.List[string] }
+        $groupAssign[$k].Add("$gname (rank $($ga.Priority))")
+    }
+}
+catch { $gaps.Add("Group policy assignments not read: $($_.Exception.Message)") }
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- EVALUATE --------------------------
+$rows = New-Object System.Collections.Generic.List[object]
+
+# Tenant configuration
+try {
+    $cfg = Get-CsTeamsMeetingConfiguration -ErrorAction Stop
+    $dis = Get-Str $cfg 'DisableAnonymousJoin'
+    $rows.Add([pscustomobject][ordered]@{
+        Priority = 3; Status = 'Info'; Policy = 'TENANT meeting configuration'; AssignedTo = 'Everyone'
+        Findings = if ($dis -eq 'True') { 'Anonymous join switched OFF tenant-wide (overrides every policy).' } else { 'Anonymous join allowed tenant-wide - each policy''s AllowAnonymousUsersToJoinMeeting decides.' }
+        Settings = "DisableAnonymousJoin=$dis; DisableAppInteractionForAnonymousUsers=$(Get-Str $cfg 'DisableAppInteractionForAnonymousUsers')"
+    })
+    $tenantAnonOff = ($dis -eq 'True')
+}
+catch { $gaps.Add("Tenant meeting configuration not read: $($_.Exception.Message)"); $tenantAnonOff = $false }
+
+foreach ($pol in $policies) {
+    $id   = Get-Str $pol 'Identity'
+    $name = $id -replace '^Tag:', ''
+    $isGlobal = ($name -eq 'Global')
+
+    $findings = New-Object System.Collections.Generic.List[string]
+    $worst = 'Pass'
+    $missing = New-Object System.Collections.Generic.List[string]
+    foreach ($c in $Checks) {
+        $v = Get-Str $pol $c.S
+        if ($null -eq $v) { $missing.Add($c.S); continue }
+        if ($c.S -in 'AllowAnonymousUsersToJoinMeeting','AllowAnonymousUsersToStartMeeting','AllowAnonymousUsersToDialOut' -and $tenantAnonOff) { continue }  # tenant switch wins
+        if ($c.S -eq 'NewMeetingRecordingExpirationDays' -and (Get-Str $pol 'AllowCloudRecording') -ne 'True') { continue }
+        if (& $c.T $v) {
+            $text = $c.F
+            if ($c.S -eq 'AutoAdmittedUsers' -and $tenantAnonOff) { $text = 'Lobby bypassed by everyone - external and guest users join without being admitted (anonymous join is off tenant-wide).' }
+            $findings.Add("[$($c.St)] $text")
+            if ((Get-StatusRank $c.St) -lt (Get-StatusRank $worst)) { $worst = $c.St }
+        }
+    }
+    if ($missing.Count) { $findings.Add("[Info] Not returned by this module version: $($missing -join ', ')") }
+
+    $groups = if ($groupAssign.ContainsKey($name)) { $groupAssign[$name] } else { @() }
+    $direct = if ($directCount.ContainsKey($name)) { $directCount[$name] } else { 0 }
+    $assigned = if ($isGlobal) { 'Everyone without another policy' }
+                else { "$(if ($directCounted) { "$direct user(s)" } else { 'users: not counted' }); $(@($groups).Count) group(s)$(if (@($groups).Count) { ': ' + ($groups -join ', ') })" }
+    if (-not $isGlobal -and $directCounted -and $direct -eq 0 -and @($groups).Count -eq 0) {
+        $findings.Add('[Info] Assigned to nobody - candidate for clean-up.')
+        if ($worst -eq 'Pass') { $worst = 'Info' }
+    }
+
+    $rows.Add([pscustomobject][ordered]@{
+        Priority   = Get-StatusRank $worst
+        Status     = $worst
+        Policy     = $name
+        AssignedTo = $assigned
+        Findings   = if ($findings.Count) { $findings -join ' | ' } else { 'Within baseline.' }
+        Settings   = ($ShownSettings | ForEach-Object { "$_=$(Get-Str $pol $_)" }) -join '; '
+    })
+}
+Disconnect-MicrosoftTeams -ErrorAction SilentlyContinue | Out-Null
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- OUTPUT ----------------------------
+$final = @($rows | Sort-Object Priority, @{ Expression = { if ($_.Policy -like 'TENANT*') { 0 } elseif ($_.Policy -eq 'Global') { 1 } else { 2 } } }, Policy)
+$stamp = $nowUtc.ToString('yyyyMMdd-HHmm')
+$csvPath = Join-Path ([System.IO.Path]::GetTempPath()) "TeamsMeetingPolicies-$stamp.csv"
+$final | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding utf8
+
+$fails = @($final | Where-Object Status -eq 'Fail').Count
+$warns = @($final | Where-Object Status -eq 'Warn').Count
+$th = 'style="background:#f0f0f0;text-align:left;padding:5px;border:1px solid #ccc"'
+$td = 'style="padding:5px;border:1px solid #ccc;vertical-align:top"'
+$sc = @{ Fail = 'color:#b00020;font-weight:600'; Warn = 'color:#b36b00;font-weight:600'; Info = 'color:#555'; Pass = 'color:#1b7f3b' }
+
+$sb = New-Object System.Text.StringBuilder
+[void]$sb.Append('<html><body style="font-family:Segoe UI,Arial,sans-serif;font-size:13px;color:#222">')
+[void]$sb.Append("<h2 style='margin-bottom:4px'>Teams meeting policy review - $(ConvertTo-HtmlSafe $TenantLabel)</h2>")
+[void]$sb.Append("<p style='margin-top:0;color:#555'>$($policies.Count) meeting policies: $fails fail, $warns warn. Read-only. Full settings in the attached CSV.</p>")
+if ($gaps.Count) {
+    [void]$sb.Append('<div style="background:#fff4e5;border-left:4px solid #e08a00;padding:8px 12px;margin:10px 0"><b>Data gaps:</b><ul style="margin:4px 0">')
+    foreach ($g in $gaps) { [void]$sb.Append("<li>$(ConvertTo-HtmlSafe $g)</li>") }
+    [void]$sb.Append('</ul></div>')
+}
+[void]$sb.Append("<table style='border-collapse:collapse'><tr><th $th>Status</th><th $th>Policy</th><th $th>Assigned to</th><th $th>Findings</th></tr>")
+foreach ($r in $final) {
+    $f = (ConvertTo-HtmlSafe $r.Findings) -replace ' \| ', '<br>'
+    [void]$sb.Append("<tr><td style='padding:5px;border:1px solid #ccc;vertical-align:top;$($sc[$r.Status])'>$($r.Status)</td><td $td><b>$(ConvertTo-HtmlSafe $r.Policy)</b></td><td $td>$(ConvertTo-HtmlSafe $r.AssignedTo)</td><td $td>$f</td></tr>")
+}
+[void]$sb.Append('</table>')
+[void]$sb.Append("<p style='color:#888;font-size:11px'>Generated by Runbook 21 (21-Review-TeamsMeetingPolicies.ps1), Azure Automation, managed identity. The Global policy applies to everyone without a direct or group assignment - a finding there affects most users.</p></body></html>")
+$html = $sb.ToString()
+
+Write-Output "Policies: $($policies.Count). Fail: $fails, Warn: $warns."
+foreach ($r in ($final | Where-Object { $_.Priority -le 2 })) { Write-Output "  [$($r.Status)] $($r.Policy): $($r.Findings)" }
+foreach ($g in $gaps) { Write-Output "  DATA GAP: $g" }
+
+if ($SendEmail) {
+    $flag = if ($fails) { "[$fails fail] " } elseif ($warns) { "[$warns warn] " } else { '' }
+    try {
+        Send-ReportEmail -From $SenderMailbox -To $Recipients -Subject "${flag}Teams meeting policy review - $TenantLabel - $($nowUtc.ToString('yyyy-MM-dd'))" `
+            -HtmlBody $html -AttachmentPath $csvPath
+        Write-Output "Report emailed to $($Recipients -join ', ')."
+    }
+    catch { Write-Error "sendMail failed from $SenderMailbox. $($_.Exception.Message)"; throw }
+    Remove-Item -LiteralPath $csvPath -Force -ErrorAction SilentlyContinue
+}
+else { Write-Output "SendEmail is off. CSV written to $csvPath." }
+#endregion -------------------------------------------------------------

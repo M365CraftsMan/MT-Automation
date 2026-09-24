@@ -1,0 +1,554 @@
+<#
+.SYNOPSIS
+    Runbook 18 - Mail flow audit: transport rules, forwarding (org, mailbox, inbox rule), connectors.
+
+.DESCRIPTION
+    Read-only. Finds mail flow configuration that leaks mail out of the tenant, bypasses filtering,
+    or hides mail from users. Changes nothing.
+
+    Sections
+      1. Org-level       Outbound spam policy AutoForwardingMode; default remote domain auto-forward
+      2. Transport rules Get-TransportRule - every rule gets a row
+      3. Mailbox fwd     ForwardingSmtpAddress / ForwardingAddress on mailboxes
+      4. Inbox rules     Get-InboxRule per mailbox (optional; circuit breaker if not permitted)
+      5. Connectors      Inbound / outbound connectors
+
+    "External" = any address whose domain is not an accepted domain of the tenant.
+
+    Findings (rank 1 = most urgent; each row lists every finding, worst wins)
+      1  External redirect/BCC/copy in a transport rule
+      1  Spam/security filtering bypass (SCL -1 or a Skip*/bypass header)
+      1  Mailbox forwards externally
+      1  Inbox rule forwards/redirects externally
+      1  External auto-forwarding allowed by an outbound spam policy
+      1  Inbound connector treats external mail as internal with no IP/cert restriction
+      2  Possible hiding rule (inbox rule moves to RSS/Conversation History, or deletes finance mail)
+      2  Transport rule silently deletes mail
+      2  Transport rule with a risky action and no conditions (applies to all mail)
+      2  Inbound connector treats mail as internal (restricted - confirm it's hybrid)
+      3  Changed in the last $RecentChangeDays days (on a rule with a risky action)
+      3  Mail routed via a connector / all outbound mail via smart host
+      3  Partner inbound connector without IP or certificate restriction
+      3  Internal forwarding (mailbox or inbox rule)
+      3  Default remote domain allows auto-forward
+      4  Disabled rule / connector, rule in test mode, rule expired but still enabled
+      9  OK
+
+.NOTES
+    Auth        : Automation Account system-assigned Managed Identity, no secrets.
+                  EXO: Connect-ExchangeOnline -ManagedIdentity -Organization <tenant>.onmicrosoft.com
+                  Mail: MI token from IDENTITY_ENDPOINT + Graph REST (no Microsoft.Graph module -
+                  conflicts with EXO's MSAL assemblies, same as Runbooks 16/17).
+    Permissions : Exchange.ManageAsApp (Office 365 Exchange Online app permission)
+                  + Entra role Global Reader on the MI (same setup as Runbook 17 - nothing new)
+                  Graph Mail.Send (granted)
+    Modules     : ExchangeOnlineManagement PINNED 3.5.0
+    Schedule    : half-yearly per the maintenance sheet. Honestly, external forwarding and hiding
+                  rules are compromise indicators - consider running sections 3-4 monthly.
+    Runtime     : org-level + transport rules + connectors are a handful of calls. Inbox rules are
+                  one call per mailbox - time the first run with $MaxMailboxesToProcess.
+
+    UNVERIFIED - settle on the first test run:
+      1. Whether Global Reader covers Get-InboxRule. If the first 3 calls fail with no successes,
+         inbox-rule checks switch off with one note in Data gaps; everything else still runs.
+      2. Exact string format of inbox rule ForwardTo/RedirectTo values in REST mode. The script
+         pulls every SMTP address out with a regex, so both '"Name" [SMTP:a@b.com]' and plain
+         'a@b.com' work; a target with no SMTP address at all is reported as unresolved.
+#>
+
+#region ---------------------------- CONFIG ----------------------------
+$TenantLabel          = 'CrucialLogics'
+$Organization         = 'contoso.onmicrosoft.com'
+$SenderMailbox        = 'm365-audits@cruciallogics.com'
+$Recipients           = @('replace-me@cruciallogics.com')
+
+$RecentChangeDays     = 30
+$IncludeInboxRules    = $true
+$InboxRuleMailboxTypes = @('UserMailbox','SharedMailbox')
+
+# Approved external forwarding targets (partner journaling, archiving vendor, etc.). Wildcards.
+# Matching targets are still listed, at rank 5, never hidden.
+$ApprovedExternalTargets = @()
+
+# Transport rules intentionally bypassing filtering (e.g. phishing-simulation vendor). Names, wildcards.
+# Still listed, at rank 5. Better long-term: move simulations to the Advanced Delivery policy.
+$ApprovedBypassRules  = @()
+
+$FinanceKeywordRegex  = '(?i)\b(invoice|payment|wire|transfer|bank|remittance|payroll|ach|swift|iban|w-?2|password|mfa|security)\b'
+$HidingFolderRegex    = '(?i)(RSS|Conversation History)'   # folders nobody reads - classic BEC hiding spots
+
+$MaxMailboxesToProcess = 0
+$TopRowsInEmail       = 25
+$SendEmail            = $true
+#endregion -------------------------------------------------------------
+
+$ErrorActionPreference = 'Stop'
+
+#region ---------------------------- HELPERS ---------------------------
+function Get-MIGraphToken {
+    if (-not $env:IDENTITY_ENDPOINT -or -not $env:IDENTITY_HEADER) {
+        throw 'IDENTITY_ENDPOINT / IDENTITY_HEADER not set. Run this in Azure Automation with the system-assigned managed identity enabled.'
+    }
+    $uri = "$($env:IDENTITY_ENDPOINT)?resource=https://graph.microsoft.com/&api-version=2019-08-01"
+    (Invoke-RestMethod -Method GET -Uri $uri -Headers @{ 'X-IDENTITY-HEADER' = $env:IDENTITY_HEADER; 'Metadata' = 'True' }).access_token
+}
+
+function Send-ReportEmail {
+    param(
+        [Parameter(Mandatory)] [string]   $From,
+        [Parameter(Mandatory)] [string[]] $To,
+        [Parameter(Mandatory)] [string]   $Subject,
+        [Parameter(Mandatory)] [string]   $HtmlBody,
+        [string] $AttachmentPath
+    )
+    $message = @{
+        subject      = $Subject
+        body         = @{ contentType = 'HTML'; content = $HtmlBody }
+        toRecipients = @($To | ForEach-Object { @{ emailAddress = @{ address = $_ } } })
+    }
+    if ($AttachmentPath -and (Test-Path -LiteralPath $AttachmentPath)) {
+        $bytes = [System.IO.File]::ReadAllBytes($AttachmentPath)
+        if ($bytes.Length -gt 3MB) {
+            Write-Warning "Attachment is $([math]::Round($bytes.Length / 1MB, 2)) MB, over the 3 MB sendMail limit. Sending without it."
+        }
+        else {
+            $message.attachments = @(@{
+                '@odata.type' = '#microsoft.graph.fileAttachment'
+                name          = [System.IO.Path]::GetFileName($AttachmentPath)
+                contentType   = 'text/csv'
+                contentBytes  = [System.Convert]::ToBase64String($bytes)
+            })
+        }
+    }
+    $payload = @{ message = $message; saveToSentItems = $false } | ConvertTo-Json -Depth 10
+    Invoke-RestMethod -Method POST -Uri "https://graph.microsoft.com/v1.0/users/$From/sendMail" `
+        -Headers @{ Authorization = "Bearer $(Get-MIGraphToken)" } -Body $payload -ContentType 'application/json' | Out-Null
+}
+
+# Property as a flat string list; $null/missing -> empty
+function Get-List {
+    param($Obj, [string]$Name)
+    $p = $Obj.PSObject.Properties[$Name]
+    if (-not $p -or $null -eq $p.Value) { return @() }
+    return @(@($p.Value) | ForEach-Object { "$_" } | Where-Object { $_ -ne '' })
+}
+function Get-Str {
+    param($Obj, [string]$Name)
+    $p = $Obj.PSObject.Properties[$Name]
+    if (-not $p -or $null -eq $p.Value) { return '' }
+    return "$($p.Value)"
+}
+
+function Get-SmtpAddresses {
+    param([string[]]$Values)
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach ($v in $Values) {
+        foreach ($m in [regex]::Matches("$v", '[A-Za-z0-9._%+\-'']+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}')) {
+            $a = $m.Value.ToLowerInvariant()
+            if (-not $out.Contains($a)) { $out.Add($a) }
+        }
+    }
+    return $out.ToArray()
+}
+
+function Test-External {
+    param([string]$Address)
+    $domain = ($Address -split '@')[-1].ToLowerInvariant()
+    return -not $script:InternalDomains.Contains($domain)
+}
+
+function Test-Like {
+    param([string]$Value, [string[]]$Patterns)
+    if (-not $Value) { return $false }
+    foreach ($p in $Patterns) { if ($Value -like $p) { return $true } }
+    return $false
+}
+
+function ConvertTo-HtmlSafe { param([string]$Text) [System.Net.WebUtility]::HtmlEncode($Text) }
+
+$FindingRank = @{
+    'External redirect/BCC/copy in transport rule'   = 1
+    'Spam/security filtering bypass'                 = 1
+    'Mailbox forwards externally'                    = 1
+    'Inbox rule forwards externally'                 = 1
+    'External auto-forwarding allowed by policy'     = 1
+    'Inbound connector: internal, unrestricted'      = 1
+    'Possible hiding rule'                           = 2
+    'Transport rule silently deletes mail'           = 2
+    'Risky action applies to all mail'               = 2
+    'Inbound connector treats mail as internal'      = 2
+    'Changed recently'                               = 3
+    'Routes mail via connector'                      = 3
+    'Partner connector unrestricted'                 = 3
+    'Internal forwarding'                            = 3
+    'Default remote domain allows auto-forward'      = 3
+    'Unresolved forwarding target'                   = 3
+    'Disabled'                                       = 4
+    'Test mode'                                      = 4
+    'Expired but enabled'                            = 4
+    'Approved exception'                             = 5
+}
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- CONNECT ---------------------------
+$nowUtc     = [datetime]::UtcNow
+$recentCut  = $nowUtc.AddDays(-$RecentChangeDays)
+$gaps       = New-Object System.Collections.Generic.List[string]
+$rows       = New-Object System.Collections.Generic.List[object]
+Write-Output "Runbook 18 - Mail flow audit. $($nowUtc.ToString('yyyy-MM-dd HH:mm')) UTC."
+
+try {
+    Import-Module ExchangeOnlineManagement -RequiredVersion 3.5.0 -ErrorAction Stop
+    Connect-ExchangeOnline -ManagedIdentity -Organization $Organization -ShowBanner:$false -ErrorAction Stop
+}
+catch {
+    Write-Error ("Connect-ExchangeOnline -ManagedIdentity failed. Check ExchangeOnlineManagement 3.5.0 is imported, " +
+        "Exchange.ManageAsApp is granted and Global Reader is assigned to the MI. $($_.Exception.Message)")
+    throw
+}
+
+$script:InternalDomains = New-Object 'System.Collections.Generic.HashSet[string]'
+foreach ($d in @(Get-AcceptedDomain)) { [void]$script:InternalDomains.Add("$($d.DomainName)".ToLowerInvariant()) }
+Write-Output "Accepted domains: $($script:InternalDomains.Count)."
+
+function Add-Row {
+    param([string]$Section, [string]$Name, [string]$Mailbox = '', [string]$State = '', [string]$Details = '',
+          [string]$Targets = '', [string]$WhenChanged = '', [System.Collections.Generic.List[string]]$Findings)
+    $names = @($Findings | Select-Object -Unique)
+    $rank  = if ($names.Count) { ($names | ForEach-Object { $FindingRank[$_] } | Measure-Object -Minimum).Minimum } else { 9 }
+    $rows.Add([pscustomobject][ordered]@{
+        Priority    = $rank
+        Findings    = if ($names.Count) { $names -join '; ' } else { 'OK' }
+        Section     = $Section
+        Name        = $Name
+        Mailbox     = $Mailbox
+        State       = $State
+        Targets     = $Targets
+        Details     = $Details
+        WhenChanged = $WhenChanged
+    })
+}
+function New-FindingList { return ,(New-Object System.Collections.Generic.List[string]) }
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- 1. ORG-LEVEL ----------------------
+try {
+    foreach ($pol in @(Get-HostedOutboundSpamFilterPolicy)) {
+        $mode = Get-Str $pol 'AutoForwardingMode'
+        $f = New-FindingList
+        if ($mode -eq 'On') { $f.Add('External auto-forwarding allowed by policy') }
+        $scope = if ((Get-Str $pol 'IsDefault') -eq 'True') { 'Default policy - applies to everyone not covered by a custom policy' } else { 'Custom policy - check its sender scope' }
+        Add-Row -Section 'Org: outbound spam policy' -Name (Get-Str $pol 'Name') -State "AutoForwardingMode=$mode" `
+            -Details "$scope. 'Automatic' = Off (Microsoft default). 'On' lets users auto-forward externally." -Findings $f
+    }
+}
+catch { $gaps.Add("Outbound spam policies unavailable: $($_.Exception.Message)") }
+
+try {
+    foreach ($rd in @(Get-RemoteDomain)) {
+        if ((Get-Str $rd 'DomainName') -ne '*') { continue }
+        $f = New-FindingList
+        if ((Get-Str $rd 'AutoForwardEnabled') -eq 'True') { $f.Add('Default remote domain allows auto-forward') }
+        Add-Row -Section 'Org: remote domain' -Name (Get-Str $rd 'Name') -State "AutoForwardEnabled=$(Get-Str $rd 'AutoForwardEnabled')" `
+            -Details 'Second layer behind the outbound spam policy. Recommended: False unless partner-specific remote domains are defined.' -Findings $f
+    }
+}
+catch { $gaps.Add("Remote domains unavailable: $($_.Exception.Message)") }
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- 2. TRANSPORT RULES ----------------
+$bypassHeaderRegex = '(?i)^X-MS-Exchange-Organization-(Skip|Bypass)|^X-Forefront-Antispam|^X-MS-Exchange-Organization-SCL'
+try {
+    $rules = @(Get-TransportRule -ResultSize Unlimited)
+    Write-Output "Transport rules: $($rules.Count)."
+    foreach ($r in $rules) {
+        $name   = Get-Str $r 'Name'
+        $state  = Get-Str $r 'State'
+        $mode   = Get-Str $r 'Mode'
+        $f      = New-FindingList
+        $approvedBypass = Test-Like $name $ApprovedBypassRules
+
+        # External recipients added by the rule
+        $targets = Get-SmtpAddresses (@(Get-List $r 'RedirectMessageTo') + @(Get-List $r 'BlindCopyTo') +
+                                      @(Get-List $r 'AddToRecipients') + @(Get-List $r 'CopyTo'))
+        $extTargets = @($targets | Where-Object { Test-External $_ })
+        $unapprovedExt = @($extTargets | Where-Object { -not (Test-Like $_ $ApprovedExternalTargets) })
+        if ($unapprovedExt.Count) { $f.Add('External redirect/BCC/copy in transport rule') }
+        elseif ($extTargets.Count) { $f.Add('Approved exception') }
+
+        # Filtering bypass
+        $scl = Get-Str $r 'SetSCL'
+        $hdr = Get-Str $r 'SetHeaderName'
+        $isBypass = ($scl -eq '-1') -or ($hdr -and $hdr -match $bypassHeaderRegex)
+        if ($isBypass) { if ($approvedBypass) { $f.Add('Approved exception') } else { $f.Add('Spam/security filtering bypass') } }
+
+        $deletes = (Get-Str $r 'DeleteMessage') -eq 'True'
+        if ($deletes) { $f.Add('Transport rule silently deletes mail') }
+
+        $connector = Get-Str $r 'RouteMessageOutboundConnector'
+        if ($connector) { $f.Add('Routes mail via connector') }
+
+        $conditions = @(Get-List $r 'Conditions')
+        $risky = $unapprovedExt.Count -or ($isBypass -and -not $approvedBypass) -or $deletes -or $connector
+        if ($risky -and $conditions.Count -eq 0) { $f.Add('Risky action applies to all mail') }
+
+        $changed = [datetime]::MinValue
+        $wc = Get-Str $r 'WhenChanged'
+        if ($wc) { [void][datetime]::TryParse($wc, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$changed) }
+        if ($risky -and $changed -gt $recentCut) { $f.Add('Changed recently') }
+
+        if ($state -eq 'Disabled') { $f.Add('Disabled') }
+        if ($mode -and $mode -ne 'Enforce') { $f.Add('Test mode') }
+        $exp = [datetime]::MinValue
+        $es = Get-Str $r 'ExpiryDate'
+        if ($es -and [datetime]::TryParse($es, [ref]$exp) -and $exp -lt $nowUtc -and $state -eq 'Enabled') { $f.Add('Expired but enabled') }
+
+        # Human-readable summary of what the rule does
+        $bits = New-Object System.Collections.Generic.List[string]
+        if ($conditions.Count) { $bits.Add("If: $($conditions -join ', ')") } else { $bits.Add('If: (no conditions - all mail)') }
+        $senderIps = Get-List $r 'SenderIpRanges'; if ($senderIps.Count) { $bits.Add("SenderIP: $($senderIps -join ', ')") }
+        $senderDom = Get-List $r 'SenderDomainIs'; if ($senderDom.Count) { $bits.Add("SenderDomain: $($senderDom -join ', ')") }
+        if ($scl) { $bits.Add("SetSCL $scl") }
+        if ($hdr) { $bits.Add("SetHeader $hdr=$(Get-Str $r 'SetHeaderValue')") }
+        if ($deletes) { $bits.Add('DeleteMessage') }
+        if ($connector) { $bits.Add("Route via $connector") }
+        if ((Get-Str $r 'StopRuleProcessing') -eq 'True') { $bits.Add('StopRuleProcessing') }
+        if ($isBypass -and $senderDom.Count -and -not $senderIps.Count) { $bits.Add('NOTE: bypass keyed on sender domain only - spoofable') }
+
+        Add-Row -Section 'Transport rule' -Name "$name (priority $(Get-Str $r 'Priority'))" -State "$state / $mode" `
+            -Targets ($targets -join '; ') -Details ($bits -join ' | ') `
+            -WhenChanged $(if ($changed -gt [datetime]::MinValue) { $changed.ToString('yyyy-MM-dd') } else { '' }) -Findings $f
+    }
+}
+catch { $gaps.Add("Transport rules unavailable: $($_.Exception.Message)") }
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- 3. MAILBOX FORWARDING -------------
+$mailboxes = @()
+try {
+    $mailboxes = @(Get-EXOMailbox -ResultSize Unlimited -RecipientTypeDetails $InboxRuleMailboxTypes `
+        -Properties ForwardingSmtpAddress, ForwardingAddress, DeliverToMailboxAndForward, PrimarySmtpAddress, RecipientTypeDetails)
+}
+catch { $gaps.Add("Mailbox list unavailable - mailbox forwarding and inbox rules skipped: $($_.Exception.Message)") }
+
+foreach ($m in $mailboxes) {
+    $fwdSmtp = (Get-Str $m 'ForwardingSmtpAddress') -replace '^(?i)smtp:', ''
+    $fwdAddr = Get-Str $m 'ForwardingAddress'
+    if (-not $fwdSmtp -and -not $fwdAddr) { continue }
+
+    $target = $fwdSmtp
+    if (-not $target -and $fwdAddr) {
+        try {
+            $rcp = Get-EXORecipient -Identity $fwdAddr -Properties PrimarySmtpAddress, ExternalEmailAddress, RecipientTypeDetails -ErrorAction Stop
+            $ext = (Get-Str $rcp 'ExternalEmailAddress') -replace '^(?i)smtp:', ''
+            $target = if ($ext) { $ext } else { Get-Str $rcp 'PrimarySmtpAddress' }
+        }
+        catch { $target = '' }
+    }
+
+    $f = New-FindingList
+    $keepCopy = (Get-Str $m 'DeliverToMailboxAndForward') -eq 'True'
+    if (-not $target) { $f.Add('Unresolved forwarding target') }
+    elseif (Test-External $target) {
+        if (Test-Like $target $ApprovedExternalTargets) { $f.Add('Approved exception') } else { $f.Add('Mailbox forwards externally') }
+    }
+    else { $f.Add('Internal forwarding') }
+
+    Add-Row -Section 'Mailbox forwarding' -Name 'Mailbox forwarding' -Mailbox (Get-Str $m 'PrimarySmtpAddress') `
+        -State $(if ($keepCopy) { 'Forward + keep copy' } else { 'Forward, NO copy kept' }) `
+        -Targets $(if ($target) { $target } else { $fwdAddr }) `
+        -Details "Type: $(Get-Str $m 'RecipientTypeDetails'). ForwardingSmtpAddress='$fwdSmtp' ForwardingAddress='$fwdAddr'" -Findings $f
+}
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- 4. INBOX RULES --------------------
+$inboxScope = $mailboxes
+if ($MaxMailboxesToProcess -gt 0 -and $inboxScope.Count -gt $MaxMailboxesToProcess) {
+    $gaps.Add("TEST MODE: inbox rules checked on $MaxMailboxesToProcess of $($inboxScope.Count) mailboxes.")
+    $inboxScope = @($inboxScope | Select-Object -First $MaxMailboxesToProcess)
+}
+$inboxState = @{ Enabled = [bool]$IncludeInboxRules; Successes = 0; Failures = 0; Pending = (New-Object System.Collections.Generic.List[string]) }
+$failed = New-Object System.Collections.Generic.List[string]
+$i = 0
+foreach ($m in $inboxScope) {
+    if (-not $inboxState.Enabled) { break }
+    $i++
+    if ($i % 100 -eq 0) { Write-Output "  ...inbox rules $i / $($inboxScope.Count)" }
+    $id = Get-Str $m 'PrimarySmtpAddress'
+    try {
+        $irules = @(Get-InboxRule -Mailbox $id -ErrorAction Stop)
+        $inboxState.Successes++
+        foreach ($pf in $inboxState.Pending) { $failed.Add($pf) }
+        $inboxState.Pending.Clear()
+    }
+    catch {
+        $inboxState.Failures++
+        if ($inboxState.Successes -gt 0) { $failed.Add("${id}: $($_.Exception.Message)") }
+        elseif ($inboxState.Failures -lt 3) { $inboxState.Pending.Add("${id}: $($_.Exception.Message)") }
+        else {
+            $inboxState.Enabled = $false
+            $inboxState.Pending.Clear()
+            $gaps.Add("Inbox rule checks switched off: the first 3 Get-InboxRule calls failed with no successes, so this identity most likely can't run it (Global Reader may not include it). Other sections are complete. Last error: $($_.Exception.Message)")
+            Write-Warning $gaps[-1]
+        }
+        continue
+    }
+
+    foreach ($ir in $irules) {
+        if ((Get-Str $ir 'Enabled') -ne 'True') { continue }
+        $fwdRaw  = @(Get-List $ir 'ForwardTo') + @(Get-List $ir 'ForwardAsAttachmentTo') + @(Get-List $ir 'RedirectTo')
+        $addrs   = Get-SmtpAddresses $fwdRaw
+        $moveTo  = Get-Str $ir 'MoveToFolder'
+        $deletes = ((Get-Str $ir 'DeleteMessage') -eq 'True') -or ($moveTo -match '(?i)Deleted Items')
+        $words   = (@(Get-List $ir 'SubjectContainsWords') + @(Get-List $ir 'SubjectOrBodyContainsWords') + @(Get-List $ir 'BodyContainsWords')) -join ' '
+
+        $f = New-FindingList
+        $ext = @($addrs | Where-Object { Test-External $_ })
+        if ($ext.Count) {
+            if (@($ext | Where-Object { -not (Test-Like $_ $ApprovedExternalTargets) }).Count) { $f.Add('Inbox rule forwards externally') }
+            else { $f.Add('Approved exception') }
+        }
+        elseif ($addrs.Count) { $f.Add('Internal forwarding') }
+        elseif ($fwdRaw.Count) { $f.Add('Unresolved forwarding target') }
+
+        $toJunk = $moveTo -match '(?i)Junk'
+        if ($moveTo -and $moveTo -match $HidingFolderRegex) { $f.Add('Possible hiding rule') }
+        elseif (($deletes -or $toJunk) -and $words -match $FinanceKeywordRegex) { $f.Add('Possible hiding rule') }
+
+        if ($f.Count -eq 0) { continue }   # ordinary sorting rules aren't reported
+        $bits = New-Object System.Collections.Generic.List[string]
+        if ($words) { $bits.Add("Words: $words") }
+        $from = (Get-List $ir 'From') -join ', '; if ($from) { $bits.Add("From: $from") }
+        if ($moveTo) { $bits.Add("MoveTo: $moveTo") }
+        if ($deletes) { $bits.Add('Deletes') }
+        if ((Get-Str $ir 'MarkAsRead') -eq 'True') { $bits.Add('MarkAsRead') }
+
+        Add-Row -Section 'Inbox rule' -Name (Get-Str $ir 'Name') -Mailbox $id -State 'Enabled' `
+            -Targets ($addrs -join '; ') -Details ($bits -join ' | ') -Findings $f
+    }
+}
+foreach ($pf in $inboxState.Pending) { $failed.Add($pf) }
+if ($failed.Count) { $gaps.Add("$($failed.Count) inbox-rule call(s) failed. First few: $(($failed | Select-Object -First 5) -join ' | ')") }
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- 5. CONNECTORS ---------------------
+try {
+    foreach ($c in @(Get-InboundConnector)) {
+        $f = New-FindingList
+        $enabled  = (Get-Str $c 'Enabled') -eq 'True'
+        $asInt    = (Get-Str $c 'TreatMessagesAsInternal') -eq 'True'
+        $ips      = Get-List $c 'SenderIPAddresses'
+        $cert     = Get-Str $c 'TlsSenderCertificateName'
+        $restricted = ($ips.Count -gt 0) -or [bool]$cert -or ((Get-Str $c 'RestrictDomainsToIPAddresses') -eq 'True') -or ((Get-Str $c 'RestrictDomainsToCertificate') -eq 'True')
+        if (-not $enabled) { $f.Add('Disabled') }
+        if ($asInt) { if ($restricted) { $f.Add('Inbound connector treats mail as internal') } else { $f.Add('Inbound connector: internal, unrestricted') } }
+        elseif ((Get-Str $c 'ConnectorType') -eq 'Partner' -and -not $restricted) { $f.Add('Partner connector unrestricted') }
+        Add-Row -Section 'Inbound connector' -Name (Get-Str $c 'Name') -State $(if ($enabled) { 'Enabled' } else { 'Disabled' }) `
+            -Details "Type=$(Get-Str $c 'ConnectorType'); TreatAsInternal=$asInt; SenderIPs=$($ips -join ', '); Cert='$cert'; RequireTls=$(Get-Str $c 'RequireTls'); SenderDomains=$((Get-List $c 'SenderDomains') -join ', ')" `
+            -WhenChanged (Get-Str $c 'WhenChanged') -Findings $f
+    }
+    foreach ($c in @(Get-OutboundConnector)) {
+        $f = New-FindingList
+        $enabled = (Get-Str $c 'Enabled') -eq 'True'
+        $domains = Get-List $c 'RecipientDomains'
+        $smart   = Get-List $c 'SmartHosts'
+        if (-not $enabled) { $f.Add('Disabled') }
+        if ($enabled -and $domains -contains '*' -and (Get-Str $c 'UseMXRecord') -ne 'True') { $f.Add('Routes mail via connector') }
+        Add-Row -Section 'Outbound connector' -Name (Get-Str $c 'Name') -State $(if ($enabled) { 'Enabled' } else { 'Disabled' }) `
+            -Details "Type=$(Get-Str $c 'ConnectorType'); RecipientDomains=$($domains -join ', '); SmartHosts=$($smart -join ', '); TlsSettings=$(Get-Str $c 'TlsSettings'); TransportRuleScoped=$(Get-Str $c 'IsTransportRuleScoped')" `
+            -WhenChanged (Get-Str $c 'WhenChanged') -Findings $f
+    }
+}
+catch { $gaps.Add("Connectors unavailable: $($_.Exception.Message)") }
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- OUTPUT ----------------------------
+Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
+
+$sectionOrder = @{ 'Org: outbound spam policy' = 0; 'Org: remote domain' = 1; 'Transport rule' = 2; 'Mailbox forwarding' = 3; 'Inbox rule' = 4; 'Inbound connector' = 5; 'Outbound connector' = 6 }
+$final = @($rows | Sort-Object Priority, { $sectionOrder[$_.Section] }, Mailbox, Name)
+
+$stamp   = $nowUtc.ToString('yyyyMMdd-HHmm')
+$csvPath = Join-Path ([System.IO.Path]::GetTempPath()) "MailFlowAudit-$stamp.csv"
+if ($final.Count) { $final | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding utf8 }
+
+$p1 = @($final | Where-Object Priority -eq 1).Count
+$p2 = @($final | Where-Object Priority -eq 2).Count
+$findingCnt = @($final | ForEach-Object { $_.Findings -split '; ' } | Where-Object { $_ -and $_ -ne 'OK' } |
+                Group-Object | Sort-Object { $FindingRank[$_.Name] }, Name)
+$bySection  = @($final | Group-Object Section | Sort-Object { $sectionOrder[$_.Name] })
+$urgent     = @($final | Where-Object { $_.Priority -le 2 } | Select-Object -First $TopRowsInEmail)
+$orgRows    = @($final | Where-Object { $_.Section -like 'Org:*' })
+
+$th  = 'style="background:#f0f0f0;text-align:left;padding:5px;border:1px solid #ccc"'
+$td  = 'style="padding:5px;border:1px solid #ccc"'
+$tdr = 'style="padding:5px;border:1px solid #ccc;text-align:right"'
+$red = 'padding:5px;border:1px solid #ccc;color:#b00020;font-weight:600'
+
+$sb = New-Object System.Text.StringBuilder
+[void]$sb.Append('<html><body style="font-family:Segoe UI,Arial,sans-serif;font-size:13px;color:#222">')
+[void]$sb.Append("<h2 style='margin-bottom:4px'>Mail flow audit - $(ConvertTo-HtmlSafe $TenantLabel)</h2>")
+[void]$sb.Append("<p style='margin-top:0;color:#555'>Transport rules, forwarding (org, mailbox, inbox rule) and connectors. Read-only - nothing was changed. Full list in the attached CSV.</p>")
+
+if ($gaps.Count) {
+    [void]$sb.Append('<div style="background:#fff4e5;border-left:4px solid #e08a00;padding:8px 12px;margin:10px 0"><b>Data gaps:</b><ul style="margin:4px 0">')
+    foreach ($g in $gaps) { [void]$sb.Append("<li>$(ConvertTo-HtmlSafe $g)</li>") }
+    [void]$sb.Append('</ul></div>')
+}
+
+if ($orgRows.Count) {
+    [void]$sb.Append("<h3>Org-level forwarding control</h3><table style='border-collapse:collapse'><tr><th $th>Setting</th><th $th>Value</th><th $th>Status</th></tr>")
+    foreach ($o in $orgRows) {
+        $st = if ($o.Priority -le 1) { "<td style='$red'>$(ConvertTo-HtmlSafe $o.Findings)</td>" } else { "<td $td>$(ConvertTo-HtmlSafe $o.Findings)</td>" }
+        [void]$sb.Append("<tr><td $td>$(ConvertTo-HtmlSafe "$($o.Section) - $($o.Name)")</td><td $td>$(ConvertTo-HtmlSafe $o.State)</td>$st</tr>")
+    }
+    [void]$sb.Append('</table>')
+}
+
+[void]$sb.Append("<h3>Findings ($p1 high, $p2 medium)</h3>")
+if ($findingCnt.Count) {
+    [void]$sb.Append("<table style='border-collapse:collapse'><tr><th $th>Finding</th><th $th>Rows</th></tr>")
+    foreach ($f in $findingCnt) {
+        $style = if ($FindingRank[$f.Name] -eq 1) { $red } else { 'padding:5px;border:1px solid #ccc' }
+        [void]$sb.Append("<tr><td style='$style'>$(ConvertTo-HtmlSafe $f.Name)</td><td $tdr>$($f.Count)</td></tr>")
+    }
+    [void]$sb.Append('</table>')
+}
+else { [void]$sb.Append('<p>No findings.</p>') }
+
+[void]$sb.Append("<h3>Objects reviewed</h3><table style='border-collapse:collapse'><tr><th $th>Section</th><th $th>Rows</th></tr>")
+foreach ($s in $bySection) { [void]$sb.Append("<tr><td $td>$(ConvertTo-HtmlSafe $s.Name)</td><td $tdr>$($s.Count)</td></tr>") }
+[void]$sb.Append("<tr><td $td>Mailboxes checked for forwarding</td><td $tdr>$($mailboxes.Count)</td></tr>")
+[void]$sb.Append("<tr><td $td>Mailboxes checked for inbox rules</td><td $tdr>$(if ($IncludeInboxRules -and $inboxState.Successes) { $inboxState.Successes } else { 0 })</td></tr></table>")
+
+if ($urgent.Count) {
+    [void]$sb.Append("<h3>Highest-risk items</h3><table style='border-collapse:collapse'><tr><th $th>Section</th><th $th>Name / mailbox</th><th $th>Targets</th><th $th>Findings</th></tr>")
+    foreach ($u in $urgent) {
+        $label = if ($u.Mailbox) { "$($u.Mailbox) - $($u.Name)" } else { $u.Name }
+        [void]$sb.Append("<tr><td $td>$(ConvertTo-HtmlSafe $u.Section)</td><td $td>$(ConvertTo-HtmlSafe $label)</td><td $td>$(ConvertTo-HtmlSafe $u.Targets)</td><td $td>$(ConvertTo-HtmlSafe $u.Findings)</td></tr>")
+    }
+    [void]$sb.Append('</table>')
+}
+[void]$sb.Append("<p style='color:#888;font-size:11px'>Generated by Runbook 18 (18-Audit-MailFlow.ps1), Azure Automation, managed identity. External = domain not in the tenant's accepted domains. External forwarding and hiding rules are compromise indicators - treat new ones as a possible incident, not a hygiene item.</p></body></html>")
+$html = $sb.ToString()
+
+Write-Output ("Rows: {0}. High: {1}, Medium: {2}." -f $final.Count, $p1, $p2)
+foreach ($f in $findingCnt) { Write-Output ("  {0,-46} {1}" -f $f.Name, $f.Count) }
+foreach ($g in $gaps) { Write-Output "  DATA GAP: $g" }
+
+if ($SendEmail) {
+    $flag    = if ($p1) { "[$p1 high-risk] " } else { '' }
+    $subject = "${flag}Mail flow audit - $TenantLabel - $($nowUtc.ToString('yyyy-MM-dd'))"
+    try {
+        Send-ReportEmail -From $SenderMailbox -To $Recipients -Subject $subject -HtmlBody $html `
+            -AttachmentPath $(if ($final.Count) { $csvPath } else { $null })
+        Write-Output "Report emailed to $($Recipients -join ', ')."
+    }
+    catch {
+        Write-Error "sendMail failed from $SenderMailbox. Check Mail.Send and the application access policy scope. $($_.Exception.Message)"
+        throw
+    }
+    Remove-Item -LiteralPath $csvPath -Force -ErrorAction SilentlyContinue
+}
+else { Write-Output "SendEmail is off. CSV written to $csvPath." }
+#endregion -------------------------------------------------------------

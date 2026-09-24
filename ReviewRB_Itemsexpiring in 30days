@@ -1,0 +1,412 @@
+<#
+.SYNOPSIS
+    Runbook 15 - Recycle bin expiry review: items that will be permanently deleted soon.
+
+.DESCRIPTION
+    Read-only. Lists everything that will be purged for good within $ExpiryWindowDays,
+    so owners get a last chance to restore it. Nothing is restored or deleted.
+
+    Section 1 - SharePoint Online site recycle bins (tenant-wide)
+      Every site from /sites/getAllSites, then /sites/{id}/recycleBin/items (Graph BETA).
+      Expiry = deletedDateTime + $RetentionDays (93). SharePoint counts the 93 days from the
+      ORIGINAL deletion, whether the item is in the first- or second-stage bin, so the stage
+      doesn't change the date. The API doesn't return the stage or who deleted it anyway.
+
+    Section 2 - Entra ID soft-deleted objects (optional, on by default)
+      Deleted Microsoft 365 groups and users, 30-day soft delete. Every one of them is
+      inside a 30-day window by definition. This matters for SharePoint too: when a deleted
+      M365 group is purged, its team site goes with it.
+
+    Urgency bands: Critical <= 7 days left, High <= 14, Medium = rest of the window.
+
+    NOT covered (need admin roles or other APIs): deleted site collections in the SPO admin
+    center, Exchange Recoverable Items, Teams chat retention.
+
+.NOTES
+    Auth        : Automation Account system-assigned Managed Identity (Connect-MgGraph -Identity)
+    Admin role  : none
+    Graph perms : Sites.Read.All     (granted Sept 9) - getAllSites + recycle bin items
+                  Directory.Read.All (granted)        - Entra deleted groups/users
+                  Mail.Send          (granted)
+                  No new CR scope.
+    Modules     : Microsoft.Graph.Authentication only (no PnP, no version floor)
+    Schedule    : monthly (per the maintenance sheet). With a monthly schedule, set
+                  $ExpiryWindowDays to 31+ or an item expiring on day 31 of a long month
+                  falls between runs.
+
+    UNVERIFIED - settle on the first test run:
+      1. The site recycle bin endpoint is BETA. Microsoft doesn't support beta in production;
+         the call fails loud per site if the shape changes.
+      2. Whether the API returns second-stage items as well as first-stage. Compare the
+         count for one test site against Site settings > Recycle bin (both stages).
+      3. Whether OneDrive (personal) sites return from getAllSites in this tenant. They
+         are excluded by URL either way unless $IncludeOneDrive is on.
+
+    Send-ReportEmail is inlined (no $PSScriptRoot dot-source). Differs from the canonical
+    copy in one way: it zips the CSV when it is over 2.5 MB so big tenants still get the file.
+#>
+
+#region ---------------------------- CONFIG ----------------------------
+$TenantLabel          = 'CrucialLogics'
+$SenderMailbox        = 'm365-audits@cruciallogics.com'
+$Recipients           = @('replace-me@cruciallogics.com')
+
+$ExpiryWindowDays     = 30     # report items purged within this many days (31+ if scheduled monthly)
+$RetentionDays        = 93     # SharePoint recycle bin retention from original deletion
+$CriticalDays         = 7
+$HighDays             = 14
+
+$IncludeOneDrive      = $false # OneDrive recycle bins are the user's own business; usually leave off
+$ExcludeSiteUrlPatterns = @()  # wildcards, e.g. '*/sites/archive-*'
+$MinItemSizeKB        = 0      # ignore items smaller than this (0 = report everything)
+
+$IncludeEntraDeleted  = $true  # deleted M365 groups + users (30-day soft delete)
+$EntraRetentionDays   = 30
+
+$MaxSitesToProcess    = 0      # 0 = all. Set small (e.g. 25) for the first timed test run.
+$TopItemsInEmail      = 25
+$SendEmail            = $true
+#endregion -------------------------------------------------------------
+
+$ErrorActionPreference = 'Stop'
+
+#region ---------------------------- HELPERS ---------------------------
+function Send-ReportEmail {
+    param(
+        [Parameter(Mandatory)] [string]   $From,
+        [Parameter(Mandatory)] [string[]] $To,
+        [Parameter(Mandatory)] [string]   $Subject,
+        [Parameter(Mandatory)] [string]   $HtmlBody,
+        [string] $AttachmentPath
+    )
+    $message = @{
+        subject      = $Subject
+        body         = @{ contentType = 'HTML'; content = $HtmlBody }
+        toRecipients = @($To | ForEach-Object { @{ emailAddress = @{ address = $_ } } })
+    }
+    if ($AttachmentPath -and (Test-Path -LiteralPath $AttachmentPath)) {
+        $path = $AttachmentPath
+        if ((Get-Item -LiteralPath $path).Length -gt 2.5MB) {
+            $zip = [System.IO.Path]::ChangeExtension($path, '.zip')
+            Compress-Archive -LiteralPath $path -DestinationPath $zip -Force
+            $path = $zip
+        }
+        $bytes = [System.IO.File]::ReadAllBytes($path)
+        if ($bytes.Length -gt 3MB) {
+            Write-Warning "Attachment is $([math]::Round($bytes.Length / 1MB, 2)) MB even zipped, over the 3 MB sendMail limit. Sending without it."
+        }
+        else {
+            $type = if ($path -like '*.zip') { 'application/zip' } else { 'text/csv' }
+            $message.attachments = @(@{
+                '@odata.type' = '#microsoft.graph.fileAttachment'
+                name          = [System.IO.Path]::GetFileName($path)
+                contentType   = $type
+                contentBytes  = [System.Convert]::ToBase64String($bytes)
+            })
+        }
+    }
+    $payload = @{ message = $message; saveToSentItems = $false } | ConvertTo-Json -Depth 10
+    Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/users/$From/sendMail" `
+        -Body $payload -ContentType 'application/json' | Out-Null
+}
+
+function ConvertTo-UtcDate {
+    param($Value)
+    if ($null -eq $Value -or "$Value" -eq '') { return $null }
+    if ($Value -is [datetime])       { return $Value.ToUniversalTime() }
+    if ($Value -is [datetimeoffset]) { return $Value.UtcDateTime }
+    $parsed = [datetimeoffset]::MinValue
+    if ([datetimeoffset]::TryParse([string]$Value, [cultureinfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) {
+        return $parsed.UtcDateTime
+    }
+    return $null
+}
+
+# GET with retry on throttling / transient errors (tenant-wide per-site loops hit 429s)
+function Invoke-GraphGet {
+    param([string]$Uri)
+    $maxAttempts = 5
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        try {
+            return Invoke-MgGraphRequest -Method GET -Uri $Uri -OutputType PSObject
+        }
+        catch {
+            $msg = "$($_.Exception.Message)"
+            $transient = $msg -match '429|TooManyRequests|503|ServiceUnavailable|504|GatewayTimeout'
+            if (-not $transient -or $attempt -eq $maxAttempts) { throw }
+            $wait = [math]::Min(60, 5 * [math]::Pow(2, $attempt - 1))
+            $retryAfter = $null
+            try { $retryAfter = $_.Exception.Response.Headers.RetryAfter.Delta.TotalSeconds } catch { }
+            if ($retryAfter) { $wait = [math]::Ceiling($retryAfter) }
+            Write-Warning "Throttled/transient on attempt $attempt, waiting $wait s: $Uri"
+            Start-Sleep -Seconds $wait
+        }
+    }
+}
+
+function Get-GraphPaged {
+    param([string]$Uri)
+    $items = New-Object System.Collections.Generic.List[object]
+    $next = $Uri
+    while ($next) {
+        $resp = Invoke-GraphGet -Uri $next
+        foreach ($i in @($resp.value)) { $items.Add($i) }
+        $next = $resp.'@odata.nextLink'
+    }
+    return $items.ToArray()
+}
+
+function Get-Urgency {
+    param([int]$DaysLeft)
+    if ($DaysLeft -le $CriticalDays) { return @{ Rank = 1; Name = 'Critical' } }
+    if ($DaysLeft -le $HighDays)     { return @{ Rank = 2; Name = 'High' } }
+    return @{ Rank = 3; Name = 'Medium' }
+}
+
+function Format-Size {
+    param([double]$Bytes)
+    if ($Bytes -ge 1GB) { return '{0:N2} GB' -f ($Bytes / 1GB) }
+    if ($Bytes -ge 1MB) { return '{0:N1} MB' -f ($Bytes / 1MB) }
+    return '{0:N0} KB' -f ($Bytes / 1KB)
+}
+
+function ConvertTo-HtmlSafe { param([string]$Text) [System.Net.WebUtility]::HtmlEncode($Text) }
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- COLLECT ---------------------------
+$nowUtc      = [datetime]::UtcNow
+$windowEnd   = $nowUtc.AddDays($ExpiryWindowDays)
+$dataGaps    = New-Object System.Collections.Generic.List[string]
+$rows        = New-Object System.Collections.Generic.List[object]
+$failedSites = New-Object System.Collections.Generic.List[string]
+
+Write-Output "Runbook 15 - Recycle bin expiry review. Items purged between now and $($windowEnd.ToString('yyyy-MM-dd')) UTC."
+
+try { Connect-MgGraph -Identity -NoWelcome }
+catch { Write-Error "Connect-MgGraph -Identity failed: $($_.Exception.Message)"; throw }
+
+# ---- Sites ----
+try {
+    $sites = @(Get-GraphPaged -Uri 'https://graph.microsoft.com/v1.0/sites/getAllSites?$select=id,displayName,webUrl')
+}
+catch {
+    Write-Error "Failed to list sites via /sites/getAllSites. A 403 means Sites.Read.All is missing or not propagated. $($_.Exception.Message)"
+    throw
+}
+
+$sites = @($sites | Where-Object {
+    $url = [string]$_.webUrl
+    if (-not $url) { return $false }
+    if (-not $IncludeOneDrive -and $url -match '-my\.sharepoint\.(com|us|de|cn)') { return $false }
+    foreach ($p in $ExcludeSiteUrlPatterns) { if ($url -like $p) { return $false } }
+    return $true
+})
+$totalSites = $sites.Count
+if ($MaxSitesToProcess -gt 0 -and $sites.Count -gt $MaxSitesToProcess) {
+    $dataGaps.Add("TEST MODE: only $MaxSitesToProcess of $totalSites sites were checked.")
+    $sites = @($sites | Select-Object -First $MaxSitesToProcess)
+}
+Write-Output "Checking recycle bins on $($sites.Count) sites."
+
+# ---- Site recycle bins ----
+$minBytes = [double]$MinItemSizeKB * 1KB
+$sitesWithItems = 0
+$scanned = 0
+foreach ($site in $sites) {
+    $scanned++
+    if ($scanned % 100 -eq 0) { Write-Output "  ...$scanned / $($sites.Count) sites" }
+    try {
+        $items = @(Get-GraphPaged -Uri "https://graph.microsoft.com/beta/sites/$($site.id)/recycleBin/items")
+    }
+    catch {
+        $failedSites.Add("$($site.webUrl) - $($_.Exception.Message)")
+        continue
+    }
+    if ($items.Count -gt 0) { $sitesWithItems++ }
+
+    foreach ($it in $items) {
+        $deleted = ConvertTo-UtcDate $it.deletedDateTime
+        if (-not $deleted) { continue }
+        $expires = $deleted.AddDays($RetentionDays)
+        if ($expires -gt $windowEnd) { continue }
+        $size = [double]0
+        if ($null -ne $it.size) { $size = [double]$it.size }
+        if ($size -lt $minBytes) { continue }
+
+        $daysLeft = [int][math]::Max(0, [math]::Floor(($expires - $nowUtc).TotalDays))
+        $u = Get-Urgency $daysLeft
+        $rows.Add([pscustomobject][ordered]@{
+            Priority     = $u.Rank
+            Urgency      = $u.Name
+            Source       = 'SharePoint'
+            Site         = $site.displayName
+            SiteUrl      = $site.webUrl
+            ItemName     = $it.name
+            DeletedFrom  = $it.deletedFromLocation
+            DeletedOn    = $deleted.ToString('yyyy-MM-dd')
+            ExpiresOn    = $expires.ToString('yyyy-MM-dd')
+            DaysLeft     = $daysLeft
+            SizeMB       = [math]::Round($size / 1MB, 2)
+            ObjectType   = 'File / list item'
+            Note         = 'Restore from Site settings > Recycle bin (check both stages).'
+            _SizeBytes   = $size
+        })
+    }
+}
+
+if ($failedSites.Count -gt 0) {
+    $sample = ($failedSites | Select-Object -First 5) -join ' | '
+    $dataGaps.Add("$($failedSites.Count) site(s) could not be read (beta endpoint error or access denied). First few: $sample")
+}
+
+# ---- Entra deleted groups / users ----
+$entraGroups = 0; $entraUsers = 0
+if ($IncludeEntraDeleted) {
+    $targets = @(
+        @{ Type = 'Microsoft 365 group'; Uri = 'https://graph.microsoft.com/v1.0/directory/deletedItems/microsoft.graph.group?$select=id,displayName,mail,deletedDateTime,groupTypes'; Note = 'Restore in Entra admin center > Groups > Deleted groups. Purge also deletes the group''s SharePoint site, mailbox and Team.' },
+        @{ Type = 'User account';        Uri = 'https://graph.microsoft.com/v1.0/directory/deletedItems/microsoft.graph.user?$select=id,displayName,userPrincipalName,deletedDateTime';     Note = 'Restore in M365 admin center > Users > Deleted users. Purge makes the mailbox and OneDrive unrecoverable through normal restore.' }
+    )
+    foreach ($t in $targets) {
+        try { $objs = @(Get-GraphPaged -Uri $t.Uri) }
+        catch {
+            $dataGaps.Add("Entra deleted $($t.Type)s unavailable: $($_.Exception.Message)")
+            continue
+        }
+        foreach ($o in $objs) {
+            $deleted = ConvertTo-UtcDate $o.deletedDateTime
+            if (-not $deleted) { continue }
+            $expires = $deleted.AddDays($EntraRetentionDays)
+            if ($expires -gt $windowEnd) { continue }
+            $daysLeft = [int][math]::Max(0, [math]::Floor(($expires - $nowUtc).TotalDays))
+            $u = Get-Urgency $daysLeft
+            $name = if ($o.userPrincipalName) { "$($o.displayName) ($($o.userPrincipalName))" }
+                    elseif ($o.mail) { "$($o.displayName) ($($o.mail))" } else { $o.displayName }
+            $rows.Add([pscustomobject][ordered]@{
+                Priority    = $u.Rank
+                Urgency     = $u.Name
+                Source      = 'Entra ID'
+                Site        = ''
+                SiteUrl     = ''
+                ItemName    = $name
+                DeletedFrom = ''
+                DeletedOn   = $deleted.ToString('yyyy-MM-dd')
+                ExpiresOn   = $expires.ToString('yyyy-MM-dd')
+                DaysLeft    = $daysLeft
+                SizeMB      = ''
+                ObjectType  = $t.Type
+                Note        = $t.Note
+                _SizeBytes  = 0
+            })
+            if ($t.Type -like '*group*') { $entraGroups++ } else { $entraUsers++ }
+        }
+    }
+}
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- OUTPUT ----------------------------
+$sorted = @($rows | Sort-Object Priority, DaysLeft, @{ Expression = '_SizeBytes'; Descending = $true })
+$export = @($sorted | Select-Object -Property * -ExcludeProperty _SizeBytes)
+
+$spRows    = @($sorted | Where-Object Source -eq 'SharePoint')
+$spBytes   = [double](($spRows | Measure-Object _SizeBytes -Sum).Sum)
+$critical  = @($sorted | Where-Object Urgency -eq 'Critical')
+$high      = @($sorted | Where-Object Urgency -eq 'High')
+$medium    = @($sorted | Where-Object Urgency -eq 'Medium')
+
+$bySite = @($spRows | Group-Object SiteUrl | ForEach-Object {
+    [pscustomobject]@{
+        Site     = ($_.Group | Select-Object -First 1).Site
+        SiteUrl  = $_.Name
+        Items    = $_.Count
+        Bytes    = [double](($_.Group | Measure-Object _SizeBytes -Sum).Sum)
+        Soonest  = ($_.Group | Measure-Object DaysLeft -Minimum).Minimum
+    }
+} | Sort-Object Soonest, @{ Expression = 'Bytes'; Descending = $true } | Select-Object -First 15)
+
+$stamp   = $nowUtc.ToString('yyyyMMdd-HHmm')
+$csvPath = Join-Path ([System.IO.Path]::GetTempPath()) "RecycleBinExpiry-$stamp.csv"
+if ($export.Count -gt 0) { $export | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding utf8 }
+
+$th  = 'style="background:#f0f0f0;text-align:left;padding:5px;border:1px solid #ccc"'
+$td  = 'style="padding:5px;border:1px solid #ccc"'
+$tdr = 'style="padding:5px;border:1px solid #ccc;text-align:right"'
+
+$sb = New-Object System.Text.StringBuilder
+[void]$sb.Append('<html><body style="font-family:Segoe UI,Arial,sans-serif;font-size:13px;color:#222">')
+[void]$sb.Append("<h2 style='margin-bottom:4px'>Recycle bin expiry review - $(ConvertTo-HtmlSafe $TenantLabel)</h2>")
+[void]$sb.Append("<p style='margin-top:0;color:#555'>Items permanently deleted by $($windowEnd.ToString('yyyy-MM-dd')) (next $ExpiryWindowDays days) unless restored. Read-only - nothing was changed. Full list in the attached CSV.</p>")
+
+if ($dataGaps.Count -gt 0) {
+    [void]$sb.Append('<div style="background:#fff4e5;border-left:4px solid #e08a00;padding:8px 12px;margin:10px 0"><b>Data gaps:</b><ul style="margin:4px 0">')
+    foreach ($g in $dataGaps) { [void]$sb.Append("<li>$(ConvertTo-HtmlSafe $g)</li>") }
+    [void]$sb.Append('</ul></div>')
+}
+
+[void]$sb.Append('<h3>Summary</h3><table style="border-collapse:collapse">')
+[void]$sb.Append("<tr><td $td>Sites checked</td><td $tdr>$($sites.Count) of $totalSites</td></tr>")
+[void]$sb.Append("<tr><td $td>SharePoint items expiring</td><td $tdr><b>$($spRows.Count)</b> ($(Format-Size $spBytes))</td></tr>")
+[void]$sb.Append("<tr><td $td>Sites affected</td><td $tdr>$(@($spRows | Select-Object -ExpandProperty SiteUrl -Unique).Count)</td></tr>")
+if ($IncludeEntraDeleted) {
+    [void]$sb.Append("<tr><td $td>Deleted M365 groups pending purge</td><td $tdr><b>$entraGroups</b></td></tr>")
+    [void]$sb.Append("<tr><td $td>Deleted users pending purge</td><td $tdr><b>$entraUsers</b></td></tr>")
+}
+[void]$sb.Append("<tr><td style='padding:5px;border:1px solid #ccc;color:#b00020;font-weight:600'>Critical (&le; $CriticalDays days)</td><td $tdr><b>$($critical.Count)</b></td></tr>")
+[void]$sb.Append("<tr><td $td>High (&le; $HighDays days)</td><td $tdr>$($high.Count)</td></tr>")
+[void]$sb.Append("<tr><td $td>Medium</td><td $tdr>$($medium.Count)</td></tr></table>")
+
+$entraRows = @($sorted | Where-Object Source -eq 'Entra ID')
+if ($entraRows.Count -gt 0) {
+    [void]$sb.Append("<h3>Deleted groups and users pending purge</h3><table style='border-collapse:collapse'><tr><th $th>Expires</th><th $th>Days</th><th $th>Type</th><th $th>Name</th></tr>")
+    foreach ($r in $entraRows) {
+        [void]$sb.Append("<tr><td $td>$($r.ExpiresOn)</td><td $tdr>$($r.DaysLeft)</td><td $td>$(ConvertTo-HtmlSafe $r.ObjectType)</td><td $td>$(ConvertTo-HtmlSafe $r.ItemName)</td></tr>")
+    }
+    [void]$sb.Append('</table><p style="color:#555;font-size:12px">A purged Microsoft 365 group takes its SharePoint site, mailbox and Team with it.</p>')
+}
+
+if ($bySite.Count -gt 0) {
+    [void]$sb.Append("<h3>Sites with expiring items (top 15, soonest first)</h3><table style='border-collapse:collapse'><tr><th $th>Site</th><th $th>Items</th><th $th>Size</th><th $th>Soonest (days)</th></tr>")
+    foreach ($s in $bySite) {
+        [void]$sb.Append("<tr><td $td><a href='$($s.SiteUrl)'>$(ConvertTo-HtmlSafe $s.Site)</a></td><td $tdr>$($s.Items)</td><td $tdr>$(Format-Size $s.Bytes)</td><td $tdr>$($s.Soonest)</td></tr>")
+    }
+    [void]$sb.Append('</table>')
+}
+
+$topSp = @($spRows | Where-Object { $_.Priority -eq 1 } | Select-Object -First $TopItemsInEmail)
+if ($topSp.Count -gt 0) {
+    [void]$sb.Append("<h3>Critical SharePoint items (largest first within each day)</h3><table style='border-collapse:collapse'><tr><th $th>Expires</th><th $th>Site</th><th $th>Item</th><th $th>Deleted from</th><th $th>Size MB</th></tr>")
+    foreach ($r in $topSp) {
+        [void]$sb.Append("<tr><td $td>$($r.ExpiresOn)</td><td $td>$(ConvertTo-HtmlSafe $r.Site)</td><td $td>$(ConvertTo-HtmlSafe $r.ItemName)</td><td $td>$(ConvertTo-HtmlSafe $r.DeletedFrom)</td><td $tdr>$($r.SizeMB)</td></tr>")
+    }
+    [void]$sb.Append('</table>')
+}
+
+if ($export.Count -eq 0) { [void]$sb.Append('<p><b>Nothing is due to be permanently deleted in this window.</b></p>') }
+
+[void]$sb.Append("<p style='color:#888;font-size:11px'>Generated by Runbook 15 (15-Review-RecycleBinExpiry.ps1), Azure Automation, managed identity. SharePoint expiry = deletion date + $RetentionDays days; items can purge earlier if a site's second-stage recycle bin exceeds its quota.</p></body></html>")
+$html = $sb.ToString()
+
+Write-Output ("SharePoint items expiring: {0} ({1}) across {2} sites; Critical {3}, High {4}, Medium {5}; Entra groups {6}, users {7}" -f `
+    $spRows.Count, (Format-Size $spBytes), $bySite.Count, $critical.Count, $high.Count, $medium.Count, $entraGroups, $entraUsers)
+foreach ($g in $dataGaps) { Write-Output "  DATA GAP: $g" }
+
+if ($SendEmail) {
+    $flag    = if ($critical.Count -gt 0) { "[$($critical.Count) purge within $CriticalDays days] " } else { '' }
+    $subject = "${flag}Recycle bin expiry review - $TenantLabel - $($nowUtc.ToString('yyyy-MM-dd'))"
+    try {
+        Send-ReportEmail -From $SenderMailbox -To $Recipients -Subject $subject -HtmlBody $html `
+            -AttachmentPath $(if ($export.Count -gt 0) { $csvPath } else { $null })
+        Write-Output "Report emailed to $($Recipients -join ', ')."
+    }
+    catch {
+        Write-Error "sendMail failed from $SenderMailbox. Check Mail.Send and the application access policy scope. $($_.Exception.Message)"
+        throw
+    }
+    foreach ($p in @($csvPath, [System.IO.Path]::ChangeExtension($csvPath, '.zip'))) {
+        if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
+    }
+}
+else {
+    Write-Output "SendEmail is off. CSV written to $csvPath."
+}
+#endregion -------------------------------------------------------------

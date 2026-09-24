@@ -1,0 +1,500 @@
+<#
+.SYNOPSIS
+    Runbook 17 - Mailbox delegation audit (Full Access, Send As, Send on Behalf, Inbox/Calendar folder delegates).
+
+.DESCRIPTION
+    Read-only. Inventories who can get into or send as someone else's mailbox, and flags the risky
+    ones. Changes nothing.
+
+    Collected
+      - Full Access          Get-EXOMailboxPermission   (per mailbox)
+      - Send As              Get-EXORecipientPermission (tenant-wide, one call)
+      - Send on Behalf       GrantSendOnBehalfTo        (from Get-EXOMailbox)
+      - Inbox / Calendar     Get-EXOMailboxFolderPermission (optional, per mailbox - the
+                             "Outlook delegate" layer that mailbox-level reports miss)
+
+    Findings (rank 1 = most urgent; one row per permission, all findings listed, worst wins)
+      1  Guest / external account holds delegation
+      1  Disabled account holds delegation
+      1  Anonymous calendar access, or whole-org access to an Inbox
+      2  Orphaned permission (deleted account, shows as a raw SID)
+      2  Delegation on a sensitive mailbox ($SensitiveMailboxes)
+      2  Broad access: one trustee holds Full Access / Send As on $BroadAccessThreshold+ mailboxes
+      3  Access to another person's own (user) mailbox
+      3  Inbox delegate, or calendar readable by the whole org
+      3  Trustee could not be resolved
+      4  Leaver mailbox (owner account disabled) still delegated - usually fine short-term, needs an end date
+      5  Shared / resource mailbox access, calendar delegates - expected, confirm membership
+
+    Trustee status (enabled / guest / group) comes from Microsoft Graph, not EXO, so disabled and
+    guest checks are authoritative.
+
+.NOTES
+    Auth        : Automation Account system-assigned Managed Identity, no secrets.
+                  EXO: Connect-ExchangeOnline -ManagedIdentity -Organization <tenant>.onmicrosoft.com
+                  Graph: MI token from IDENTITY_ENDPOINT + REST (Microsoft.Graph module NOT loaded -
+                  EXO and Graph modules ship conflicting MSAL assemblies, same reason as Runbook 16).
+    Permissions : Office 365 Exchange Online  Exchange.ManageAsApp  (application permission, NEW)
+                  + Entra directory role GLOBAL READER on the MI's service principal (read-only).
+                  Both are required: ManageAsApp lets the MI call EXO at all, the role decides
+                  which cmdlets it may run. Global Reader cannot read mailbox CONTENT.
+                  Microsoft Graph Directory.Read.All (granted) - trustee account status
+                  Microsoft Graph Mail.Send (granted)
+    Modules     : ExchangeOnlineManagement PINNED 3.5.0 (3.5.1+ breaks on PS 7.2/.NET 6 - pilot finding)
+    Schedule    : half-yearly per the maintenance sheet (Monthly recurrence, every 6 months)
+    Runtime     : ~1 EXO call per mailbox for Full Access, +2 more per mailbox if folder checks are on.
+                  Time the first run with $MaxMailboxesToProcess. Azure Automation fair-share limit
+                  is 3 hours per job.
+
+    UNVERIFIED - settle on the first test run:
+      0. Whether Global Reader covers Get-EXOMailboxFolderStatistics / Get-EXOMailboxFolderPermission.
+         Full Access and Send As are standard view-only reads. If folder calls are refused, the
+         script turns folder checks off after 3 straight failures and says so once in Data gaps,
+         instead of logging one failure per mailbox.
+      1. Format of GrantSendOnBehalfTo values in EXO REST mode (display name vs alias vs DN).
+         Unresolved Send on Behalf trustees are reported, never silently dropped.
+      2. Shape of the User property on Get-EXOMailboxFolderPermission output (object with
+         DisplayName vs plain string). The script handles both.
+#>
+
+#region ---------------------------- CONFIG ----------------------------
+$TenantLabel            = 'CrucialLogics'
+$Organization           = 'contoso.onmicrosoft.com'   # the tenant's .onmicrosoft.com domain
+$SenderMailbox          = 'm365-audits@cruciallogics.com'
+$Recipients             = @('replace-me@cruciallogics.com')
+
+$MailboxTypes           = @('UserMailbox','SharedMailbox','RoomMailbox','EquipmentMailbox')
+$IncludeFolderPermissions = $true   # Inbox + Calendar delegates (2 extra calls per mailbox)
+
+# Mailboxes where any delegation is escalated (wildcards on primary SMTP address)
+$SensitiveMailboxes     = @('ceo@*','cfo@*','hr@*','payroll@*','legal@*')
+$BroadAccessThreshold   = 10        # trustee with Full Access / Send As on this many mailboxes = flag
+
+# Trustees to ignore entirely (backup / archiving / migration service accounts). Wildcards.
+$ExcludeTrustees        = @()
+
+$MaxMailboxesToProcess  = 0         # 0 = all. Set small (e.g. 50) for the first timed run.
+$TopRowsInEmail         = 25
+$SendEmail              = $true
+#endregion -------------------------------------------------------------
+
+$ErrorActionPreference = 'Stop'
+
+#region ---------------------------- HELPERS ---------------------------
+function Get-MIGraphToken {
+    if (-not $env:IDENTITY_ENDPOINT -or -not $env:IDENTITY_HEADER) {
+        throw 'IDENTITY_ENDPOINT / IDENTITY_HEADER not set. Run this in Azure Automation with the system-assigned managed identity enabled.'
+    }
+    $uri = "$($env:IDENTITY_ENDPOINT)?resource=https://graph.microsoft.com/&api-version=2019-08-01"
+    (Invoke-RestMethod -Method GET -Uri $uri -Headers @{ 'X-IDENTITY-HEADER' = $env:IDENTITY_HEADER; 'Metadata' = 'True' }).access_token
+}
+
+function Get-GraphAll {
+    param([string]$Uri, [string]$Token)
+    $out = New-Object System.Collections.Generic.List[object]
+    $next = $Uri
+    while ($next) {
+        $resp = Invoke-RestMethod -Method GET -Uri $next -Headers @{ Authorization = "Bearer $Token" }
+        foreach ($v in @($resp.value)) { $out.Add($v) }
+        $next = $resp.'@odata.nextLink'
+    }
+    return $out.ToArray()
+}
+
+# REST version of Send-ReportEmail (no Microsoft.Graph module - see NOTES)
+function Send-ReportEmail {
+    param(
+        [Parameter(Mandatory)] [string]   $From,
+        [Parameter(Mandatory)] [string[]] $To,
+        [Parameter(Mandatory)] [string]   $Subject,
+        [Parameter(Mandatory)] [string]   $HtmlBody,
+        [string] $AttachmentPath
+    )
+    $message = @{
+        subject      = $Subject
+        body         = @{ contentType = 'HTML'; content = $HtmlBody }
+        toRecipients = @($To | ForEach-Object { @{ emailAddress = @{ address = $_ } } })
+    }
+    if ($AttachmentPath -and (Test-Path -LiteralPath $AttachmentPath)) {
+        $bytes = [System.IO.File]::ReadAllBytes($AttachmentPath)
+        if ($bytes.Length -gt 3MB) {
+            Write-Warning "Attachment is $([math]::Round($bytes.Length / 1MB, 2)) MB, over the 3 MB sendMail limit. Sending without it."
+        }
+        else {
+            $message.attachments = @(@{
+                '@odata.type' = '#microsoft.graph.fileAttachment'
+                name          = [System.IO.Path]::GetFileName($AttachmentPath)
+                contentType   = 'text/csv'
+                contentBytes  = [System.Convert]::ToBase64String($bytes)
+            })
+        }
+    }
+    $payload = @{ message = $message; saveToSentItems = $false } | ConvertTo-Json -Depth 10
+    Invoke-RestMethod -Method POST -Uri "https://graph.microsoft.com/v1.0/users/$From/sendMail" `
+        -Headers @{ Authorization = "Bearer $(Get-MIGraphToken)" } -Body $payload -ContentType 'application/json' | Out-Null
+}
+
+function Test-Like {
+    param([string]$Value, [string[]]$Patterns)
+    if (-not $Value) { return $false }
+    foreach ($p in $Patterns) { if ($Value -like $p) { return $true } }
+    return $false
+}
+
+function ConvertTo-HtmlSafe { param([string]$Text) [System.Net.WebUtility]::HtmlEncode($Text) }
+
+$FindingRank = @{
+    'Guest/external trustee'              = 1
+    'Disabled trustee account'            = 1
+    'Anonymous calendar access'           = 1
+    'Inbox open to whole org'             = 1
+    'Orphaned permission (deleted account)' = 2
+    'Sensitive mailbox'                   = 2
+    'Broad access'                        = 2
+    'Personal mailbox access'             = 3
+    'Inbox delegate'                      = 3
+    'Calendar open to whole org'          = 3
+    'Unresolved trustee'                  = 3
+    'Leaver mailbox still delegated'      = 4
+    'Shared/resource mailbox (expected)'  = 5
+    'Calendar delegate'                   = 5
+}
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- CONNECT + DIRECTORY ---------------
+$nowUtc = [datetime]::UtcNow
+$gaps   = New-Object System.Collections.Generic.List[string]
+Write-Output "Runbook 17 - Mailbox delegation audit. $($nowUtc.ToString('yyyy-MM-dd HH:mm')) UTC."
+
+# Directory lookup from Graph first (fails fast if the MI token or Directory.Read.All is broken)
+$token = Get-MIGraphToken
+try {
+    $dirUsers = Get-GraphAll -Token $token -Uri 'https://graph.microsoft.com/v1.0/users?$select=id,displayName,userPrincipalName,mail,accountEnabled,userType,proxyAddresses&$top=999'
+    $dirGroups = Get-GraphAll -Token $token -Uri 'https://graph.microsoft.com/v1.0/groups?$filter=mailEnabled eq true&$select=id,displayName,mail&$top=999'
+}
+catch { Write-Error "Graph directory read failed (Directory.Read.All?): $($_.Exception.Message)"; throw }
+
+$userByKey  = @{}
+$userByName = @{}
+foreach ($u in $dirUsers) {
+    foreach ($k in @($u.userPrincipalName, $u.mail) + @($u.proxyAddresses | ForEach-Object { ($_ -replace '^smtp:', '') })) {
+        if ($k) { $userByKey["$k".ToLowerInvariant()] = $u }
+    }
+    $dn = "$($u.displayName)".ToLowerInvariant()
+    if ($dn) { if ($userByName.ContainsKey($dn)) { $userByName[$dn] = 'AMBIGUOUS' } else { $userByName[$dn] = $u } }
+}
+$groupByKey = @{}
+foreach ($g in $dirGroups) {
+    foreach ($k in @($g.mail, $g.displayName)) { if ($k) { $groupByKey["$k".ToLowerInvariant()] = $g } }
+}
+Write-Output "Directory: $($dirUsers.Count) users, $($dirGroups.Count) mail-enabled groups."
+
+try {
+    Import-Module ExchangeOnlineManagement -RequiredVersion 3.5.0 -ErrorAction Stop
+    Connect-ExchangeOnline -ManagedIdentity -Organization $Organization -ShowBanner:$false -ErrorAction Stop
+}
+catch {
+    Write-Error ("Connect-ExchangeOnline -ManagedIdentity failed. Check: ExchangeOnlineManagement 3.5.0 imported, " +
+        "Exchange.ManageAsApp granted to the MI, and Global Reader assigned to the MI (role can take up to an hour to reach EXO). $($_.Exception.Message)")
+    throw
+}
+
+$mailboxes = @(Get-EXOMailbox -ResultSize Unlimited -RecipientTypeDetails $MailboxTypes `
+    -Properties GrantSendOnBehalfTo, ExternalDirectoryObjectId, RecipientTypeDetails, DisplayName, UserPrincipalName, PrimarySmtpAddress)
+$totalMailboxes = $mailboxes.Count
+if ($MaxMailboxesToProcess -gt 0 -and $mailboxes.Count -gt $MaxMailboxesToProcess) {
+    $gaps.Add("TEST MODE: only $MaxMailboxesToProcess of $totalMailboxes mailboxes checked for Full Access / folder permissions. Broad-access counts are partial.")
+    $mailboxes = @($mailboxes | Select-Object -First $MaxMailboxesToProcess)
+}
+$mailboxBySmtp = @{}
+foreach ($m in $mailboxes) {
+    foreach ($k in @($m.PrimarySmtpAddress, $m.UserPrincipalName)) { if ($k) { $mailboxBySmtp["$k".ToLowerInvariant()] = $m } }
+}
+Write-Output "Mailboxes in scope: $($mailboxes.Count) of $totalMailboxes."
+
+function Resolve-Trustee {
+    param([string]$Raw)
+    $r = "$Raw".Trim()
+    $key = $r.ToLowerInvariant()
+    if ($r -match '^S-1-5-21-')          { return @{ Type = 'Orphaned SID'; Name = $r; Enabled = ''; Upn = '' } }
+    if ($userByKey.ContainsKey($key)) {
+        $u = $userByKey[$key]
+        $type = if ($u.userType -eq 'Guest') { 'Guest' } else { 'User' }
+        return @{ Type = $type; Name = $u.displayName; Enabled = [bool]$u.accountEnabled; Upn = $u.userPrincipalName }
+    }
+    if ($groupByKey.ContainsKey($key))  { return @{ Type = 'Group'; Name = $groupByKey[$key].displayName; Enabled = ''; Upn = $groupByKey[$key].mail } }
+    if ($userByName.ContainsKey($key) -and $userByName[$key] -ne 'AMBIGUOUS') {
+        $u = $userByName[$key]
+        $type = if ($u.userType -eq 'Guest') { 'Guest' } else { 'User' }
+        return @{ Type = $type; Name = $u.displayName; Enabled = [bool]$u.accountEnabled; Upn = $u.userPrincipalName }
+    }
+    return @{ Type = 'Unresolved'; Name = $r; Enabled = ''; Upn = '' }
+}
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- COLLECT ---------------------------
+$rows = New-Object System.Collections.Generic.List[object]
+
+function Add-DelegationRow {
+    param($Mailbox, [string]$PermissionType, [string]$AccessRights, [string]$RawTrustee, [string[]]$ExtraFindings = @(), $Resolved = $null)
+    if (Test-Like $RawTrustee $ExcludeTrustees) { return }
+    $t = if ($Resolved) { $Resolved } else { Resolve-Trustee $RawTrustee }
+    if ($t.Upn -and (Test-Like $t.Upn $ExcludeTrustees)) { return }
+
+    $mbxSmtp  = "$($Mailbox.PrimarySmtpAddress)"
+    $mbxType  = "$($Mailbox.RecipientTypeDetails)"
+    $owner    = $userByKey["$($Mailbox.UserPrincipalName)".ToLowerInvariant()]
+    $ownerEnabled = if ($owner) { [bool]$owner.accountEnabled } else { $null }
+
+    # A trustee that is itself a shared/resource mailbox account is disabled in Entra by design
+    $trusteeIsResourceMbx = $t.Upn -and $mailboxBySmtp.ContainsKey($t.Upn.ToLowerInvariant()) -and
+        ($mailboxBySmtp[$t.Upn.ToLowerInvariant()].RecipientTypeDetails -ne 'UserMailbox')
+
+    $f = New-Object System.Collections.Generic.List[string]
+    foreach ($x in $ExtraFindings) { if ($x) { $f.Add($x) } }
+    switch ($t.Type) {
+        'Guest'        { $f.Add('Guest/external trustee') }
+        'Orphaned SID' { $f.Add('Orphaned permission (deleted account)') }
+        'Unresolved'   { if ($PermissionType -ne 'SendOnBehalf') { $f.Add('Unresolved trustee') } }
+    }
+    if ($t.Type -in 'User','Guest' -and $t.Enabled -eq $false -and -not $trusteeIsResourceMbx) { $f.Add('Disabled trustee account') }
+    if (Test-Like $mbxSmtp $SensitiveMailboxes) { $f.Add('Sensitive mailbox') }
+    if ($mbxType -eq 'UserMailbox') {
+        if ($PermissionType -in 'FullAccess','SendAs','SendOnBehalf') { $f.Add('Personal mailbox access') }
+        if ($ownerEnabled -eq $false) { $f.Add('Leaver mailbox still delegated') }
+    }
+    elseif ($PermissionType -in 'FullAccess','SendAs','SendOnBehalf') { $f.Add('Shared/resource mailbox (expected)') }
+
+    $rows.Add([pscustomobject]@{
+        Mailbox          = $mbxSmtp
+        MailboxName      = $Mailbox.DisplayName
+        MailboxType      = $mbxType
+        MailboxOwnerEnabled = $ownerEnabled
+        PermissionType   = $PermissionType
+        AccessRights     = $AccessRights
+        Trustee          = if ($t.Upn) { $t.Upn } else { $t.Name }
+        TrusteeName      = $t.Name
+        TrusteeType      = $t.Type
+        TrusteeEnabled   = $t.Enabled
+        _Findings        = $f
+    })
+}
+
+# ---- Send As: tenant-wide in one call ----
+$sendAsCount = 0
+try {
+    foreach ($p in @(Get-EXORecipientPermission -ResultSize Unlimited)) {
+        if ("$($p.AccessControlType)" -ne 'Allow' -or $p.IsInherited) { continue }
+        if ("$($p.Trustee)" -like 'NT AUTHORITY\*') { continue }
+        $mbx = $mailboxBySmtp["$($p.Identity)".ToLowerInvariant()]
+        if (-not $mbx) {
+            # Identity may come back as display name / alias; fall back to a name match inside scope
+            $mbx = $mailboxes | Where-Object { $_.DisplayName -eq $p.Identity -or $_.Identity -eq $p.Identity } | Select-Object -First 1
+        }
+        if (-not $mbx) { continue }   # recipient not a mailbox in scope (groups, contacts, or TEST MODE)
+        Add-DelegationRow -Mailbox $mbx -PermissionType 'SendAs' -AccessRights (@($p.AccessRights) -join ',') -RawTrustee "$($p.Trustee)"
+        $sendAsCount++
+    }
+}
+catch { $gaps.Add("Send As collection failed: $($_.Exception.Message)") }
+
+# ---- Per mailbox: Send on Behalf, Full Access, folders ----
+$failed = New-Object System.Collections.Generic.List[string]
+$folderState = @{ Enabled = [bool]$IncludeFolderPermissions; Successes = 0; Failures = 0; Pending = (New-Object System.Collections.Generic.List[string]) }
+$i = 0
+foreach ($m in $mailboxes) {
+    $i++
+    if ($i % 100 -eq 0) { Write-Output "  ...$i / $($mailboxes.Count) mailboxes" }
+    $id = "$($m.PrimarySmtpAddress)"
+
+    foreach ($sob in @($m.GrantSendOnBehalfTo | Where-Object { $_ })) {
+        Add-DelegationRow -Mailbox $m -PermissionType 'SendOnBehalf' -AccessRights 'SendOnBehalf' -RawTrustee "$sob"
+    }
+
+    try {
+        foreach ($p in @(Get-EXOMailboxPermission -Identity $id)) {
+            if ($p.IsInherited -or $p.Deny) { continue }
+            $u = "$($p.User)"
+            if ($u -like 'NT AUTHORITY\*') { continue }
+            Add-DelegationRow -Mailbox $m -PermissionType 'FullAccess' -AccessRights (@($p.AccessRights) -join ',') -RawTrustee $u
+        }
+    }
+    catch { $failed.Add("$id FullAccess: $($_.Exception.Message)") }
+
+    if (-not $folderState.Enabled) { continue }
+    foreach ($scope in 'Inbox','Calendar') {
+        if (-not $folderState.Enabled) { break }
+        try {
+            $folder = @(Get-EXOMailboxFolderStatistics -Identity $id -FolderScope $scope |
+                Where-Object { "$($_.FolderType)" -eq $scope }) | Select-Object -First 1
+            if (-not $folder) { continue }
+            $path = "$($folder.FolderPath)".TrimStart('/').Replace('/', '\')
+            foreach ($fp in @(Get-EXOMailboxFolderPermission -Identity "${id}:\$path")) {
+                $who = if ($fp.User -and $fp.User.PSObject.Properties['DisplayName']) { "$($fp.User.DisplayName)" } else { "$($fp.User)" }
+                $rights = @($fp.AccessRights | ForEach-Object { "$_" })
+                $rightsStr = $rights -join ','
+                $isDelegate = ("$($fp.SharingPermissionFlags)" -match 'Delegate')
+                $level = if ($rights | Where-Object { $_ -in 'Owner','PublishingEditor','Editor' }) { 'Edit' }
+                         elseif ($rights | Where-Object { $_ -in 'Reviewer','Author','NonEditingAuthor','PublishingAuthor','ReadItems' }) { 'Read' }
+                         else { 'Low' }   # None, AvailabilityOnly, LimitedDetails, FolderVisible, etc.
+
+                if ($who -in 'Default','Anonymous') {
+                    $extra = $null
+                    if ($scope -eq 'Inbox' -and $level -ne 'Low') { $extra = 'Inbox open to whole org' }
+                    elseif ($scope -eq 'Calendar' -and $level -ne 'Low') {
+                        $extra = if ($who -eq 'Anonymous') { 'Anonymous calendar access' } else { 'Calendar open to whole org' }
+                    }
+                    if ($extra) {
+                        Add-DelegationRow -Mailbox $m -PermissionType "Folder:$scope" -AccessRights $rightsStr -RawTrustee $who `
+                            -ExtraFindings @($extra) -Resolved @{ Type = $who; Name = $who; Enabled = ''; Upn = '' }
+                    }
+                    continue
+                }
+                if ($level -eq 'Low' -and -not $isDelegate) { continue }
+                $extra = if ($scope -eq 'Inbox') { 'Inbox delegate' } else { 'Calendar delegate' }
+                if ($scope -eq 'Calendar' -and $level -ne 'Edit' -and -not $isDelegate) { continue }  # calendar Reviewer = noise
+                $flagSuffix = if ($isDelegate) { ' (Outlook delegate)' } else { '' }
+                Add-DelegationRow -Mailbox $m -PermissionType "Folder:$scope" -AccessRights ($rightsStr + $flagSuffix) -RawTrustee $who -ExtraFindings @($extra)
+            }
+            $folderState.Successes++
+            # Folder cmdlets do work - earlier failures were genuine per-mailbox errors, keep them
+            foreach ($pf in $folderState.Pending) { $failed.Add($pf) }
+            $folderState.Pending.Clear()
+        }
+        catch {
+            $folderState.Failures++
+            if ($folderState.Successes -gt 0) { $failed.Add("$id ${scope}: $($_.Exception.Message)") }
+            elseif ($folderState.Failures -lt 3) { $folderState.Pending.Add("$id ${scope}: $($_.Exception.Message)") }
+            else {
+                $folderState.Enabled = $false
+                $folderState.Pending.Clear()
+                $gaps.Add("Inbox/Calendar folder checks switched off: the first 3 folder calls failed with no successes, so this identity most likely can't run the folder cmdlets (Global Reader may not include them). Mailbox-level results are complete. Last error: $($_.Exception.Message)")
+                Write-Warning $gaps[-1]
+            }
+        }
+    }
+}
+foreach ($pf in $folderState.Pending) { $failed.Add($pf) }   # fewer than 3 failures total, breaker never decided
+if ($failed.Count -gt 0) {
+    $gaps.Add("$($failed.Count) per-mailbox call(s) failed. First few: $(($failed | Select-Object -First 5) -join ' | ')")
+}
+
+# ---- Broad access (second pass) ----
+$broad = @{}
+foreach ($r in $rows) {
+    if ($r.PermissionType -notin 'FullAccess','SendAs') { continue }
+    if ($r.TrusteeType -in 'Default','Anonymous') { continue }
+    $k = "$($r.Trustee)".ToLowerInvariant()
+    if (-not $broad.ContainsKey($k)) { $broad[$k] = New-Object 'System.Collections.Generic.HashSet[string]' }
+    [void]$broad[$k].Add($r.Mailbox)
+}
+foreach ($r in $rows) {
+    $k = "$($r.Trustee)".ToLowerInvariant()
+    if ($r.PermissionType -in 'FullAccess','SendAs' -and $broad.ContainsKey($k) -and $broad[$k].Count -ge $BroadAccessThreshold) {
+        $r._Findings.Add("Broad access")
+    }
+}
+#endregion -------------------------------------------------------------
+
+#region ---------------------------- OUTPUT ----------------------------
+$final = foreach ($r in $rows) {
+    $names = @($r._Findings | Select-Object -Unique)
+    $rank  = if ($names.Count) { ($names | ForEach-Object { $FindingRank[$_] } | Measure-Object -Minimum).Minimum } else { 9 }
+    $k = "$($r.Trustee)".ToLowerInvariant()
+    [pscustomobject][ordered]@{
+        Priority            = $rank
+        Findings            = if ($names.Count) { $names -join '; ' } else { 'None' }
+        Mailbox             = $r.Mailbox
+        MailboxName         = $r.MailboxName
+        MailboxType         = $r.MailboxType
+        MailboxOwnerEnabled = $r.MailboxOwnerEnabled
+        PermissionType      = $r.PermissionType
+        AccessRights        = $r.AccessRights
+        Trustee             = $r.Trustee
+        TrusteeName         = $r.TrusteeName
+        TrusteeType         = $r.TrusteeType
+        TrusteeEnabled      = $r.TrusteeEnabled
+        TrusteeMailboxCount = if ($broad.ContainsKey($k)) { $broad[$k].Count } else { '' }
+    }
+}
+$final = @($final | Sort-Object Priority, Mailbox, PermissionType, Trustee)
+
+$stamp   = $nowUtc.ToString('yyyyMMdd-HHmm')
+$csvPath = Join-Path ([System.IO.Path]::GetTempPath()) "MailboxDelegation-$stamp.csv"
+if ($final.Count -gt 0) { $final | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding utf8 }
+
+$byType     = @($final | Group-Object PermissionType | Sort-Object Name)
+$findingCnt = @($final | ForEach-Object { $_.Findings -split '; ' } | Where-Object { $_ -and $_ -ne 'None' } |
+                Group-Object | Sort-Object { $FindingRank[$_.Name] }, Name)
+$topTrustees = @($broad.GetEnumerator() | Sort-Object { $_.Value.Count } -Descending | Select-Object -First 10)
+$urgent     = @($final | Where-Object { $_.Priority -le 2 } | Select-Object -First $TopRowsInEmail)
+$p1 = @($final | Where-Object Priority -eq 1).Count
+$p2 = @($final | Where-Object Priority -eq 2).Count
+
+$th  = 'style="background:#f0f0f0;text-align:left;padding:5px;border:1px solid #ccc"'
+$td  = 'style="padding:5px;border:1px solid #ccc"'
+$tdr = 'style="padding:5px;border:1px solid #ccc;text-align:right"'
+
+$sb = New-Object System.Text.StringBuilder
+[void]$sb.Append('<html><body style="font-family:Segoe UI,Arial,sans-serif;font-size:13px;color:#222">')
+[void]$sb.Append("<h2 style='margin-bottom:4px'>Mailbox delegation audit - $(ConvertTo-HtmlSafe $TenantLabel)</h2>")
+[void]$sb.Append("<p style='margin-top:0;color:#555'>$($mailboxes.Count) mailboxes, $($final.Count) delegations. Read-only - nothing was changed. Full list in the attached CSV.</p>")
+
+if ($gaps.Count -gt 0) {
+    [void]$sb.Append('<div style="background:#fff4e5;border-left:4px solid #e08a00;padding:8px 12px;margin:10px 0"><b>Data gaps:</b><ul style="margin:4px 0">')
+    foreach ($g in $gaps) { [void]$sb.Append("<li>$(ConvertTo-HtmlSafe $g)</li>") }
+    [void]$sb.Append('</ul></div>')
+}
+
+[void]$sb.Append("<h3>Findings</h3><table style='border-collapse:collapse'><tr><th $th>Finding</th><th $th>Rows</th></tr>")
+foreach ($f in $findingCnt) {
+    $style = if ($FindingRank[$f.Name] -eq 1) { 'padding:5px;border:1px solid #ccc;color:#b00020;font-weight:600' } else { 'padding:5px;border:1px solid #ccc' }
+    [void]$sb.Append("<tr><td style='$style'>$(ConvertTo-HtmlSafe $f.Name)</td><td $tdr>$($f.Count)</td></tr>")
+}
+[void]$sb.Append('</table>')
+
+[void]$sb.Append("<h3>By permission type</h3><table style='border-collapse:collapse'><tr><th $th>Type</th><th $th>Count</th></tr>")
+foreach ($b in $byType) { [void]$sb.Append("<tr><td $td>$(ConvertTo-HtmlSafe $b.Name)</td><td $tdr>$($b.Count)</td></tr>") }
+[void]$sb.Append('</table>')
+
+if ($topTrustees.Count -gt 0) {
+    [void]$sb.Append("<h3>Trustees with the widest access (Full Access / Send As)</h3><table style='border-collapse:collapse'><tr><th $th>Trustee</th><th $th>Mailboxes</th></tr>")
+    foreach ($t in $topTrustees) {
+        $style = if ($t.Value.Count -ge $BroadAccessThreshold) { 'padding:5px;border:1px solid #ccc;text-align:right;color:#b00020;font-weight:600' } else { 'padding:5px;border:1px solid #ccc;text-align:right' }
+        [void]$sb.Append("<tr><td $td>$(ConvertTo-HtmlSafe $t.Key)</td><td style='$style'>$($t.Value.Count)</td></tr>")
+    }
+    [void]$sb.Append('</table>')
+}
+
+if ($urgent.Count -gt 0) {
+    [void]$sb.Append("<h3>Highest-risk delegations</h3><table style='border-collapse:collapse'><tr><th $th>Mailbox</th><th $th>Type</th><th $th>Trustee</th><th $th>Findings</th></tr>")
+    foreach ($r in $urgent) {
+        [void]$sb.Append("<tr><td $td>$(ConvertTo-HtmlSafe $r.Mailbox)</td><td $td>$(ConvertTo-HtmlSafe $r.PermissionType)</td><td $td>$(ConvertTo-HtmlSafe $r.Trustee)</td><td $td>$(ConvertTo-HtmlSafe $r.Findings)</td></tr>")
+    }
+    [void]$sb.Append('</table>')
+}
+[void]$sb.Append("<p style='color:#888;font-size:11px'>Generated by Runbook 17 (17-Audit-MailboxDelegation.ps1), Azure Automation, managed identity. Mail forwarding and inbox rules are covered by the mail flow audit, not here.</p></body></html>")
+$html = $sb.ToString()
+
+Write-Output ("Delegations: {0}. Priority 1: {1}, Priority 2: {2}. Send As rows: {3}." -f $final.Count, $p1, $p2, $sendAsCount)
+foreach ($f in $findingCnt) { Write-Output ("  {0,-40} {1}" -f $f.Name, $f.Count) }
+foreach ($g in $gaps) { Write-Output "  DATA GAP: $g" }
+
+Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
+
+if ($SendEmail) {
+    $flag    = if ($p1 -gt 0) { "[$p1 high-risk] " } else { '' }
+    $subject = "${flag}Mailbox delegation audit - $TenantLabel - $($nowUtc.ToString('yyyy-MM-dd'))"
+    try {
+        Send-ReportEmail -From $SenderMailbox -To $Recipients -Subject $subject -HtmlBody $html `
+            -AttachmentPath $(if ($final.Count -gt 0) { $csvPath } else { $null })
+        Write-Output "Report emailed to $($Recipients -join ', ')."
+    }
+    catch {
+        Write-Error "sendMail failed from $SenderMailbox. Check Mail.Send and the application access policy scope. $($_.Exception.Message)"
+        throw
+    }
+    Remove-Item -LiteralPath $csvPath -Force -ErrorAction SilentlyContinue
+}
+else { Write-Output "SendEmail is off. CSV written to $csvPath." }
+#endregion -------------------------------------------------------------
